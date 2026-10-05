@@ -1,0 +1,17 @@
+[package]
+name = "gdrive-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line control for the gdrive-linux sync daemon"
+
+[[bin]]
+name = "gdrive"
+path = "src/main.rs"
+
+[dependencies]
+gdrive-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }

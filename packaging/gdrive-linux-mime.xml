@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-gdrive-link">
+    <comment>Google Drive document link</comment>
+    <sub-class-of type="application/json"/>
+    <generic-icon name="text-html"/>
+    <glob pattern="*.gdoc"/>
+    <glob pattern="*.gsheet"/>
+    <glob pattern="*.gslides"/>
+    <glob pattern="*.gdraw"/>
+    <glob pattern="*.gform"/>
+    <glob pattern="*.gsite"/>
+    <glob pattern="*.gmap"/>
+    <glob pattern="*.gjam"/>
+    <glob pattern="*.gscript"/>
+    <glob pattern="*.gtable"/>
+    <glob pattern="*.gvid"/>
+    <glob pattern="*.glink"/>
+  </mime-type>
+</mime-info>

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Google Drive (gdrive-linux)
+GenericName=Cloud Sync
+Comment=Keep a local folder in sync with Google Drive
+Exec=gdrive-app --show
+Icon=gdrive-linux
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=google;drive;sync;cloud;
+StartupNotify=false
+StartupWMClass=gdrive-app

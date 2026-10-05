@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/gdrive-core", "crates/gdrived", "crates/gdrive-cli", "app/src-tauri"]
+# The Tauri app needs WebKitGTK headers, which only exist in the `gdrive-dev`
+# distrobox. A plain `cargo build` on the host builds the daemon and CLI only.
+default-members = ["crates/gdrive-core", "crates/gdrived", "crates/gdrive-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+gdrive-core = { path = "crates/gdrive-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+lto = "thin"
+strip = true

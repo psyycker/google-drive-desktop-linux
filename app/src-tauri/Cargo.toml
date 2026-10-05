@@ -1,0 +1,35 @@
+[package]
+name = "gdrive-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Desktop UI and tray icon for gdrive-linux"
+
+[[bin]]
+name = "gdrive-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+gdrive-core = { workspace = true }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+ksni = "0.3"
+png = "0.17"
+dirs = "5"
+
+[features]
+default = ["custom-protocol"]
+# Embeds the frontend into the binary (what `tauri build` enables). Without the
+# Tauri CLI this must be on, otherwise Tauri expects a dev server.
+custom-protocol = ["tauri/custom-protocol"]
