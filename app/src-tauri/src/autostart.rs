@@ -55,7 +55,7 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
          Name=Google Drive\n\
          Comment=Keep your Google Drive in sync\n\
          Exec={}\n\
-         Icon=gdrive-linux\n\
+         Icon=gdrive-app\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n",
         exec_quote(&exe.to_string_lossy())

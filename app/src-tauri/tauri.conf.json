@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "gdrive-linux",
-  "version": "0.1.0",
   "identifier": "io.github.gdrive-linux",
   "build": {
     "frontendDist": "../ui"

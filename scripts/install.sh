@@ -31,7 +31,7 @@ for size in 32 128 512; do
   [ "$size" = 512 ] && src="app/src-tauri/icons/icon.png"
   if [ -f "$src" ]; then
     mkdir -p "$ICONS/${size}x${size}/apps"
-    install -m644 "$src" "$ICONS/${size}x${size}/apps/gdrive-linux.png"
+    install -m644 "$src" "$ICONS/${size}x${size}/apps/gdrive-app.png"
   fi
 done
 

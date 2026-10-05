@@ -11,7 +11,7 @@ rm -f "$HOME/.local/bin/gdrived" "$HOME/.local/bin/gdrive" "$HOME/.local/bin/gdr
 rm -f "$DATA/applications/gdrive-linux.desktop" "$DATA/applications/gdrive-open.desktop"
 rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/gdrive-linux.desktop"
 rm -f "$DATA/mime/packages/gdrive-linux.xml"
-rm -f "$DATA"/icons/hicolor/*/apps/gdrive-linux.png
+rm -f "$DATA"/icons/hicolor/*/apps/gdrive-app.png
 rm -rf "$DATA/doc/gdrive-linux"
 update-mime-database "$DATA/mime" >/dev/null 2>&1 || true
 echo "Uninstalled."

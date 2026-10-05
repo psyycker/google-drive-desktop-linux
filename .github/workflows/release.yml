@@ -1,0 +1,143 @@
+name: Release
+
+# Push a tag like `v0.2.0` to build every Linux package and publish a GitHub Release.
+# "Run workflow" from the Actions tab builds the same artifacts without releasing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 keeps the glibc requirement low (2.35), so the binaries run
+          # on most current distributions. Both architectures build natively.
+          - arch: x86_64
+            runner: ubuntu-22.04
+            deb_arch: amd64
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev build-essential curl wget file patchelf xdg-utils
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            # Stamp the tag's version into the workspace so binaries and packages agree.
+            sed -i "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml
+          else
+            version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
+      - name: Run tests
+        run: cargo test -p gdrive-core
+
+      - name: Build daemon and CLI
+        run: cargo build --release -p gdrived -p gdrive-cli
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version '^2' --locked
+
+      - name: Bundle AppImage, deb and rpm
+        env:
+          # linuxdeploy is itself an AppImage; let it self-extract instead of needing FUSE.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
+        run: |
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p app/src-tauri/binaries
+          cp target/release/gdrived "app/src-tauri/binaries/gdrived-$triple"
+          cp target/release/gdrive "app/src-tauri/binaries/gdrive-$triple"
+          cd app/src-tauri
+          cargo tauri build --config tauri.bundle.conf.json --bundles appimage,deb,rpm
+
+      - name: Collect artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p out
+          bundle=target/release/bundle
+          cp "$(ls $bundle/appimage/*.AppImage | head -1)" "out/gdrive-linux-$VERSION-$ARCH.AppImage"
+          cp $bundle/deb/*.deb out/
+          cp $bundle/rpm/*.rpm out/
+
+          # Headless option: just the daemon and CLI, plus the systemd user unit.
+          stage="gdrive-linux-$VERSION-$ARCH-cli"
+          mkdir -p "$stage"
+          cp target/release/gdrived target/release/gdrive "$stage/"
+          cp packaging/gdrived.service README.md "$stage/"
+          tar -czf "out/$stage.tar.gz" "$stage"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: out
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd out
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Downloads
+
+            | File | For |
+            |---|---|
+            | `gdrive-linux-*-x86_64.AppImage` / `-aarch64.AppImage` | Any distro: `chmod +x` and run. Includes the app, daemon (`--daemon`) and CLI (`--cli`). |
+            | `gdrive-linux_*_amd64.deb` / `_arm64.deb` | Debian, Ubuntu, Mint, Pop!_OS |
+            | `gdrive-linux-*.x86_64.rpm` / `.aarch64.rpm` | Fedora, openSUSE, RHEL |
+            | `gdrive-linux-*-cli.tar.gz` | Headless/servers: `gdrived` + `gdrive` + systemd user unit |
+
+            First run: create a Google OAuth "Desktop app" client, then paste its ID and secret into the app. See the [README](https://github.com/${{ github.repository }}#1-create-a-google-oauth-client-one-time-5-minutes).

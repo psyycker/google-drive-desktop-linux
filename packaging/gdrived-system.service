@@ -1,0 +1,18 @@
+[Unit]
+Description=gdrive-linux Google Drive sync daemon
+Documentation=https://github.com/psyycker/google-drive-desktop-linux
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gdrived
+Restart=on-failure
+RestartSec=5
+# Let systemd stop us gracefully so in-flight DB writes finish.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

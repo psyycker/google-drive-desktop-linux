@@ -57,6 +57,24 @@ Ignored automatically: editor swap/lock files (`.~lock.*#`, `.*.swp`, `*~`, …)
 partial downloads (`*.part`, `*.crdownload`) and the client's own `.gdrive-linux/`
 folder. Add your own glob patterns in Settings.
 
+## Download
+
+Prebuilt packages for **x86_64** and **aarch64** are attached to every
+[GitHub release](https://github.com/psyycker/google-drive-desktop-linux/releases):
+
+| File | For |
+|---|---|
+| `gdrive-linux-<version>-<arch>.AppImage` | Any distro: `chmod +x` and run. One file holding the app, the daemon (`--daemon`) and the CLI (`--cli …`). |
+| `.deb` | Debian, Ubuntu, Mint, Pop!_OS |
+| `.rpm` | Fedora, openSUSE, RHEL |
+| `gdrive-linux-<version>-<arch>-cli.tar.gz` | Headless/servers: `gdrived` + `gdrive` + the systemd user unit |
+
+Releases are built by `.github/workflows/release.yml` whenever a `v*` tag is pushed:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
 ## 1. Create a Google OAuth client (one-time, ~5 minutes)
 
 Google requires every app that talks to Drive to have its own OAuth client:
@@ -72,7 +90,7 @@ Google requires every app that talks to Drive to have its own OAuth client:
 5. **Credentials → Create credentials → OAuth client ID** → application type
    **Desktop app**. Copy the **Client ID** and **Client secret**.
 
-## 2. Build and install
+## 2. Build and install (from source)
 
 On Bazzite/Silverblue, the Tauri app is built inside a distrobox that has the
 WebKitGTK headers; the resulting binary runs on the host.

@@ -26,7 +26,7 @@ cp target/release/gdrive "app/src-tauri/binaries/gdrive-$TRIPLE"
 # linuxdeploy is itself an AppImage; containers usually lack FUSE, so let it self-extract.
 # Its bundled `strip` is too old for current Fedora binaries, hence NO_STRIP.
 (cd app/src-tauri && APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=true \
-  "$CARGO" tauri build --config tauri.appimage.conf.json --bundles appimage)
+  "$CARGO" tauri build --config tauri.bundle.conf.json --bundles appimage)
 
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 mkdir -p dist
