@@ -30,8 +30,10 @@ trash = "5"
 filetime = "0.2"
 gethostname = "0.5"
 bytes = "1"
+libc = "0.2"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 axum = "0.8"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

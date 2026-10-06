@@ -85,6 +85,30 @@ pub struct ItemError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePhase {
+    /// A newer version exists. If `automatic`, it installs once syncing is idle.
+    Available,
+    Downloading,
+    /// Verified and swapped in; the daemon is restarting into it.
+    Installing,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpdateInfo {
+    pub latest: String,
+    pub phase: UpdatePhase,
+    /// True when this install can update itself (AppImage in a writable folder,
+    /// automatic updates enabled); otherwise the user updates manually.
+    pub automatic: bool,
+    pub release_url: String,
+    pub message: Option<String>,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
 /// Snapshot of the daemon's state, served over IPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Status {
@@ -97,14 +121,57 @@ pub struct Status {
     /// Number of items waiting to be reconciled.
     pub pending: usize,
     pub transfers: Vec<Transfer>,
+    /// Current total download speed across all transfers, in bytes per second.
+    #[serde(default)]
+    pub download_bps: u64,
+    /// Current total upload speed across all transfers, in bytes per second.
+    #[serde(default)]
+    pub upload_bps: u64,
     /// Newest first.
     pub recent: VecDeque<Activity>,
     /// Newest first.
     pub errors: VecDeque<ItemError>,
     pub last_synced: Option<DateTime<Utc>>,
+    /// Version of the running daemon.
+    #[serde(default)]
+    pub version: String,
+    /// Set when a newer release exists.
+    #[serde(default)]
+    pub update: Option<UpdateInfo>,
+}
+
+/// "4.2 MB", "310 KB", "12 B" (binary units, like file managers).
+pub fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut v = n as f64 / 1024.0;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if v >= 100.0 {
+        format!("{v:.0} {}", UNITS[i])
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
 }
 
 impl Status {
+    /// "↓ 4.2 MB/s · ↑ 310 KB/s" for whichever directions are moving; `None` when idle.
+    pub fn speed_text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.download_bps > 0 {
+            parts.push(format!("↓ {}/s", human_bytes(self.download_bps)));
+        }
+        if self.upload_bps > 0 {
+            parts.push(format!("↑ {}/s", human_bytes(self.upload_bps)));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     pub fn new(state: SyncState, sync_root: String) -> Self {
         Self {
             state,
@@ -114,9 +181,13 @@ impl Status {
             sync_root,
             pending: 0,
             transfers: Vec::new(),
+            download_bps: 0,
+            upload_bps: 0,
             recent: VecDeque::new(),
             errors: VecDeque::new(),
             last_synced: None,
+            version: crate::update::CURRENT_VERSION.to_owned(),
+            update: None,
         }
     }
 

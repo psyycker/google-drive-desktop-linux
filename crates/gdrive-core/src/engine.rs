@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{ApiError, DriveClient, Progress, SHORTCUT_MIME};
 use crate::auth::AuthRevoked;
+use crate::bandwidth::SpeedMeter;
 use crate::config::{Config, META_DIR};
 use crate::db::{Db, RemoteItem, SyncedItem};
 use crate::gdoc;
@@ -58,9 +59,15 @@ impl EngineHandle {
         self.join.is_finished()
     }
 
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         self.cancel.cancel();
-        let _ = self.join.await;
+        // The engine only awaits at points where its state is consistent, so if it
+        // doesn't wind down promptly it's safe to abort it.
+        if tokio::time::timeout(Duration::from_secs(5), &mut self.join).await.is_err() {
+            tracing::warn!("sync engine did not stop in time; aborting it");
+            self.join.abort();
+            let _ = self.join.await;
+        }
     }
 }
 
@@ -69,7 +76,15 @@ pub fn start(config: &Config, api: DriveClient, db: Db, status: Arc<RwLock<Statu
     let (tx, rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     let engine = Engine::new(config, api, db, status, cancel.clone());
-    let join = tokio::spawn(engine.run(rx));
+    let stop = cancel.clone();
+    // Long awaits inside the engine (listing a huge Drive, API calls) don't watch the
+    // token themselves; racing the whole run against it makes stopping immediate.
+    let join = tokio::spawn(async move {
+        tokio::select! {
+            _ = stop.cancelled() => {}
+            _ = engine.run(rx) => {}
+        }
+    });
     EngineHandle { tx, cancel, join }
 }
 
@@ -210,6 +225,8 @@ struct Engine {
     first_event_at: Option<Instant>,
     last_quota: Option<Instant>,
     last_full_scan: Instant,
+    download_meter: SpeedMeter,
+    upload_meter: SpeedMeter,
 }
 
 fn is_fatal(err: &anyhow::Error) -> bool {
@@ -220,6 +237,7 @@ impl Engine {
     fn new(config: &Config, api: DriveClient, db: Db, status: Arc<RwLock<Status>>, cancel: CancellationToken) -> Self {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         let root = config.sync_root.clone();
+        api.bandwidth().set_limits(config.max_download_mb_per_sec, config.max_upload_mb_per_sec);
         Self {
             shared: Arc::new(Shared {
                 root: root.clone(),
@@ -249,6 +267,8 @@ impl Engine {
             first_event_at: None,
             last_quota: None,
             last_full_scan: Instant::now(),
+            download_meter: SpeedMeter::default(),
+            upload_meter: SpeedMeter::default(),
         }
     }
 
@@ -355,6 +375,12 @@ impl Engine {
         }
 
         self.check_root(true)?;
+        // Partial downloads from a previous run that was interrupted.
+        if let Ok(entries) = std::fs::read_dir(self.shared.tmp_dir()) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
 
         // Watch before scanning so nothing slips between the scan and the watch.
         if watcher.is_none() {
@@ -378,9 +404,13 @@ impl Engine {
             _ => self.full_remote_listing().await?,
         }
         self.db().set_meta("email", &self.email)?;
-        // Recheck every synced item to catch changes made while we weren't running.
+        // Recheck every synced item to catch changes made while we weren't running,
+        // and every remote item never synced: the work queue lives in memory, so after
+        // a crash or restart mid-sync this is the only way to finish the job.
         let synced = self.db().all_synced()?;
         self.dirty_ids.extend(synced.into_iter().map(|s| s.id));
+        let unsynced = self.db().unsynced_remote_ids()?;
+        self.dirty_ids.extend(unsynced);
         self.full_local_scan();
         Ok(())
     }
@@ -551,14 +581,15 @@ impl Engine {
         if let Some(e) = err {
             let path = match &work {
                 Work::Path(p) => rel_str(p),
-                Work::Id(id) => self
-                    .db()
-                    .get_synced(id)
-                    .ok()
-                    .flatten()
-                    .map(|s| rel_str(&s.rel_path))
-                    .or_else(|| self.remote_path(id).ok().flatten().map(|(_, p)| rel_str(&p)))
-                    .unwrap_or_else(|| id.clone()),
+                Work::Id(id) => {
+                    // Separate statement: the DB guard must be dropped before
+                    // remote_path() locks the (non-reentrant) mutex again.
+                    let synced = self.db().get_synced(id).ok().flatten();
+                    match synced {
+                        Some(s) => rel_str(&s.rel_path),
+                        None => self.remote_path(id).ok().flatten().map_or_else(|| id.clone(), |(_, p)| rel_str(&p)),
+                    }
+                }
             };
             tracing::warn!("{path}: {e:#} (retry in {backoff:?})");
             self.shared.status.write().unwrap().push_error(path, format!("{e:#}"));
@@ -607,6 +638,9 @@ impl Engine {
         let mut st = self.shared.status.write().unwrap();
         st.transfers = transfers;
         st.pending = pending;
+        let bandwidth = self.shared.api.bandwidth();
+        st.download_bps = self.download_meter.sample(bandwidth.download.total());
+        st.upload_bps = self.upload_meter.sample(bandwidth.upload.total());
     }
 
     // ------------------------------------------------------------------ remote tree

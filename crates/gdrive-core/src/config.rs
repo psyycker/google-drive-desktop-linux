@@ -22,6 +22,12 @@ pub struct Config {
     /// When a file is deleted on Drive, move the local copy to the desktop trash
     /// instead of deleting it permanently.
     pub use_local_trash: bool,
+    /// Total download speed limit in MB/s across all transfers; 0 = unlimited.
+    pub max_download_mb_per_sec: f64,
+    /// Total upload speed limit in MB/s across all transfers; 0 = unlimited.
+    pub max_upload_mb_per_sec: f64,
+    /// Install new versions automatically when syncing is idle (AppImage only).
+    pub auto_update: bool,
 }
 
 impl Default for Config {
@@ -34,6 +40,9 @@ impl Default for Config {
             max_concurrent_transfers: 4,
             ignore: Vec::new(),
             use_local_trash: true,
+            max_download_mb_per_sec: 0.0,
+            max_upload_mb_per_sec: 0.0,
+            auto_update: true,
         }
     }
 }

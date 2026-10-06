@@ -57,6 +57,7 @@ let activeTab = 'activity';
 let mode = null;          // 'main' | 'onboarding'
 let editingStep1 = false;
 let polling = false;
+let appVersion = null;    // this app's own version (the daemon may be newer after an update)
 const rendered = {};      // last HTML per container, to avoid needless DOM churn
 
 // ---------------------------------------------------------------- helpers
@@ -187,6 +188,7 @@ function render() {
     renderRecent();
     renderErrors();
     renderAccountCard();
+    renderUpdates();
   }
   renderLoginUrls();
   updateSavebar();
@@ -234,6 +236,14 @@ function renderHeader() {
   $('btn-open-folder').disabled = !joinRoot('');
 }
 
+/** "↓ 4.2 MB/s · ↑ 310 KB/s" for whichever directions are moving, or ''. */
+function speedText(s) {
+  const parts = [];
+  if (s.download_bps > 0) parts.push(`↓ ${fmtBytes(s.download_bps)}/s`);
+  if (s.upload_bps > 0) parts.push(`↑ ${fmtBytes(s.upload_bps)}/s`);
+  return parts.join(' · ');
+}
+
 function bannerInfo() {
   if (!status) {
     return {
@@ -253,8 +263,9 @@ function bannerInfo() {
     }
     case 'syncing': {
       const title = n > 0 ? `Syncing ${plural(n, 'item', 'items')}` : s.pending > 0 ? `Syncing ${plural(s.pending, 'item', 'items')}` : 'Syncing…';
-      const sub = s.pending > n ? `${plural(s.pending, 'change', 'changes')} waiting` : 'Keeping your files up to date';
-      return { tone: 'busy', icon: 'refresh', spin: true, title, sub };
+      const waiting = s.pending > n ? `${plural(s.pending, 'change', 'changes')} waiting` : 'Keeping your files up to date';
+      const speed = speedText(s);
+      return { tone: 'busy', icon: 'refresh', spin: true, title, sub: speed ? `${speed} · ${waiting}` : waiting };
     }
     case 'paused':
       return { tone: 'neutral', icon: 'pause', title: 'Paused', sub: s.pending ? `${plural(s.pending, 'change', 'changes')} will sync when you resume` : 'Changes will sync when you resume' };
@@ -377,6 +388,64 @@ function renderErrors() {
   setHtml($('errors'), rows.join(''));
 }
 
+/** Compares "1.2.3"-style versions: negative, zero or positive. */
+function cmpVersion(a, b) {
+  const parse = (v) => String(v).replace(/^v/, '').split(/[-+]/)[0].split('.').map((n) => Number.parseInt(n, 10) || 0);
+  const [x, y] = [parse(a), parse(b)];
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+  return 0;
+}
+
+function renderUpdates() {
+  const u = status && status.update;
+  const running = status && status.version;
+  let line;
+  let sub = '';
+  let action = null;
+  let progress = null;
+  if (appVersion && running && cmpVersion(running, appVersion) > 0) {
+    line = `Updated to version ${running}`;
+    sub = 'Restart the app to finish updating. It restarts by itself next time this window is closed.';
+    action = { label: 'Restart now', cmd: 'restart_app' };
+  } else if (!u) {
+    line = `Version ${appVersion || running || '…'}`;
+    sub = status ? 'You have the latest version.' : '';
+  } else {
+    switch (u.phase) {
+      case 'available':
+        line = `Version ${u.latest} is available`;
+        sub = u.automatic ? 'It will install automatically once syncing is idle.' : 'Download it from the release page.';
+        if (!u.automatic) action = { label: 'Download', url: u.release_url };
+        break;
+      case 'downloading':
+        line = `Downloading version ${u.latest}…`;
+        progress = u.bytes_total > 0 ? u.bytes_done / u.bytes_total : null;
+        sub = u.bytes_total > 0 ? `${fmtBytes(u.bytes_done)} of ${fmtBytes(u.bytes_total)}` : '';
+        break;
+      case 'installing':
+        line = `Installing version ${u.latest}…`;
+        sub = u.message || '';
+        break;
+      default:
+        line = `Couldn’t install version ${u.latest}`;
+        sub = u.message || '';
+        action = { label: 'Download', url: u.release_url };
+    }
+  }
+  $('update-line').textContent = line;
+  $('update-sub').textContent = sub;
+  const btn = $('btn-update-action');
+  btn.hidden = !action;
+  if (action) {
+    btn.textContent = action.label;
+    btn.dataset.cmd = action.cmd || '';
+    btn.dataset.url = action.url || '';
+  }
+  const bar = $('update-progress');
+  bar.hidden = progress == null;
+  if (progress != null) bar.firstElementChild.style.width = `${(progress * 100).toFixed(1)}%`;
+}
+
 function renderAccountCard() {
   const acct = status && status.account;
   setHtml($('account-line'), acct
@@ -449,7 +518,10 @@ function fillForm(c) {
   $('f-root').value = c.sync_root || '';
   $('f-poll').value = c.poll_interval_secs ?? 15;
   $('f-conc').value = c.max_concurrent_transfers ?? 4;
+  $('f-down-limit').value = c.max_download_mb_per_sec > 0 ? c.max_download_mb_per_sec : '';
+  $('f-up-limit').value = c.max_upload_mb_per_sec > 0 ? c.max_upload_mb_per_sec : '';
   $('f-trash').checked = !!c.use_local_trash;
+  $('f-auto-update').checked = c.auto_update !== false;
   $('f-ignore').value = (c.ignore || []).join('\n');
 }
 
@@ -469,6 +541,13 @@ function collectConfig() {
     if (!Number.isFinite(v) || v < min || v > max) throw new Error(`${name} must be between ${min} and ${max}`);
     return v;
   };
+  const limit = (id, name) => {
+    const raw = $(id).value.trim();
+    if (raw === '') return 0;
+    const v = Number.parseFloat(raw);
+    if (!Number.isFinite(v) || v < 0) throw new Error(`${name} must be a positive number of MB/s, or empty for unlimited`);
+    return v;
+  };
   const root = $('f-root').value.trim();
   if (!root.startsWith('/')) throw new Error('The Google Drive folder must be an absolute path');
   return {
@@ -478,7 +557,10 @@ function collectConfig() {
     sync_root: root.length > 1 ? root.replace(/\/+$/, '') : root,
     poll_interval_secs: int('f-poll', 5, 3600, 'Check interval'),
     max_concurrent_transfers: int('f-conc', 1, 16, 'Parallel transfers'),
+    max_download_mb_per_sec: limit('f-down-limit', 'Download limit'),
+    max_upload_mb_per_sec: limit('f-up-limit', 'Upload limit'),
     use_local_trash: $('f-trash').checked,
+    auto_update: $('f-auto-update').checked,
     ignore: $('f-ignore').value.split('\n').map((l) => l.trim()).filter(Boolean),
   };
 }
@@ -627,6 +709,17 @@ function bind() {
     }
   });
 
+  // Updates.
+  onClick('btn-check-updates', (btn) => withBusy(btn, async () => {
+    await run('check_for_updates', undefined, 'Checking for updates…');
+    await poll();
+  }));
+  $('btn-update-action').addEventListener('click', (e) => {
+    const { cmd, url } = e.currentTarget.dataset;
+    if (cmd) run(cmd);
+    else if (url) run('open_url', { url });
+  });
+
   // Account.
   onClick('btn-signin', startLogin);
   $('btn-signout').addEventListener('click', () => { $('signout-confirm').hidden = false; });
@@ -672,6 +765,7 @@ function bind() {
 
 async function init() {
   bind();
+  try { appVersion = await invoke('app_version'); } catch (_) { /* older shell */ }
   await loadConfig();
   loadAutostart();
   await poll();

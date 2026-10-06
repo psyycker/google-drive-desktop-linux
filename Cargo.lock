@@ -1528,6 +1528,7 @@ dependencies = [
  "gethostname",
  "globset",
  "hex",
+ "libc",
  "md-5",
  "notify",
  "rand 0.8.8",

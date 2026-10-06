@@ -65,6 +65,10 @@ impl TrayView {
                 } else {
                     "Syncing…".to_string()
                 };
+                let text = match s.speed_text() {
+                    Some(speed) => format!("{text} {speed}"),
+                    None => text,
+                };
                 (TrayKind::Syncing, text)
             }
             SyncState::Paused => (TrayKind::Paused, "Paused".to_string()),
@@ -218,7 +222,7 @@ impl ksni::Tray for GDriveTray {
 /// Starts the tray and its status poller. Returns `false` if no tray could be shown
 /// (no StatusNotifierItem host), in which case only the window is available.
 pub async fn start(app: tauri::AppHandle, refresh: Arc<Notify>) -> bool {
-    let initial = current_view().await;
+    let (initial, _) = current_view().await;
     let tray = GDriveTray { app: app.clone(), refresh: refresh.clone(), view: initial.clone() };
     let handle = match tray.spawn().await {
         Ok(h) => Some(h),
@@ -236,7 +240,10 @@ pub async fn start(app: tauri::AppHandle, refresh: Arc<Notify>) -> bool {
                 _ = tokio::time::sleep(POLL_INTERVAL) => {}
                 _ = refresh.notified() => {}
             }
-            let view = current_view().await;
+            let (view, status) = current_view().await;
+            if let Some(status) = &status {
+                crate::selfupdate::relaunch_if_outdated(&app, status);
+            }
             if view != last {
                 if let Some(h) = &handle {
                     let v = view.clone();
@@ -249,9 +256,9 @@ pub async fn start(app: tauri::AppHandle, refresh: Arc<Notify>) -> bool {
     shown
 }
 
-async fn current_view() -> TrayView {
+async fn current_view() -> (TrayView, Option<gdrive_core::status::Status>) {
     match daemon::status_or_spawn().await {
-        Ok(s) => TrayView::from_status(&s),
-        Err(_) => TrayView::unreachable(),
+        Ok(s) => (TrayView::from_status(&s), Some(s)),
+        Err(_) => (TrayView::unreachable(), None),
     }
 }

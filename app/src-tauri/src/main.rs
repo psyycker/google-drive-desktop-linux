@@ -7,6 +7,7 @@ mod autostart;
 mod commands;
 mod daemon;
 mod icons;
+mod selfupdate;
 mod tray;
 
 use std::sync::Arc;
@@ -54,6 +55,8 @@ fn exec_bundled_tool() {
 
 fn main() {
     exec_bundled_tool();
+    gdrive_core::update::mark_inherited_fds_cloexec();
+    selfupdate::wait_for_replaced_instance();
 
     // WebKitGTK's DMA-BUF renderer kills the process with "Error 71 (Protocol error)
     // dispatching to Wayland display" on NVIDIA (and some other) drivers. This window is
@@ -92,6 +95,9 @@ fn main() {
             commands::set_config,
             commands::open_path,
             commands::open_url,
+            commands::app_version,
+            commands::check_for_updates,
+            commands::restart_app,
             commands::get_autostart,
             commands::set_autostart,
         ])

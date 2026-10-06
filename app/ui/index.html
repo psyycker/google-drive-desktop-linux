@@ -114,6 +114,17 @@
               <input id="f-conc" type="number" min="1" max="16" step="1" data-cfg>
             </div>
           </div>
+          <div class="field-pair">
+            <div class="field">
+              <label for="f-down-limit">Download limit</label>
+              <div class="input-suffix"><input id="f-down-limit" type="number" min="0" step="0.1" placeholder="Unlimited" data-cfg><span>MB/s</span></div>
+            </div>
+            <div class="field">
+              <label for="f-up-limit">Upload limit</label>
+              <div class="input-suffix"><input id="f-up-limit" type="number" min="0" step="0.1" placeholder="Unlimited" data-cfg><span>MB/s</span></div>
+            </div>
+          </div>
+          <p class="hint">Leave a limit empty (or 0) for unlimited. Limits apply to all transfers combined and take effect immediately.</p>
           <label class="check">
             <input id="f-trash" type="checkbox" data-cfg>
             <span>Move files deleted on Drive to the local trash</span>
@@ -159,6 +170,25 @@
           <label class="check">
             <input id="f-autostart" type="checkbox">
             <span>Start Google Drive when I log in</span>
+          </label>
+        </div>
+
+        <div class="card" id="updates-card">
+          <h2>Updates</h2>
+          <div class="row-between">
+            <div>
+              <div id="update-line">Version …</div>
+              <div class="hint" id="update-sub"></div>
+            </div>
+            <div class="btn-row">
+              <button class="btn btn-sm" id="btn-check-updates">Check now</button>
+              <button class="btn btn-primary btn-sm" id="btn-update-action" hidden></button>
+            </div>
+          </div>
+          <div class="progress down" id="update-progress" hidden><div></div></div>
+          <label class="check">
+            <input id="f-auto-update" type="checkbox" data-cfg>
+            <span>Install updates automatically when syncing is idle</span>
           </label>
         </div>
 

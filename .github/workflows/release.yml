@@ -29,6 +29,8 @@ jobs:
             runner: ubuntu-22.04-arm
             deb_arch: arm64
     runs-on: ${{ matrix.runner }}
+    # A hung test (e.g. a deadlock regression) must not burn the 6-hour default.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

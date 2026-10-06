@@ -326,3 +326,9 @@ details.help b { color: var(--text); font-weight: 600; }
 ::-webkit-scrollbar { width: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; border: 3px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background-color: var(--text-3); }
+
+/* Updates card */
+#updates-card .row-between { margin-bottom: 12px; }
+#update-line { font-weight: 500; }
+#update-progress { height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; margin: -4px 0 12px; }
+#update-progress > div { height: 100%; width: 0; background: var(--accent); border-radius: 2px; transition: width .5s ease; }

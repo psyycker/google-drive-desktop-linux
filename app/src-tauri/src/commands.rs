@@ -119,6 +119,22 @@ pub async fn open_url(url: String) -> CmdResult<()> {
 }
 
 #[tauri::command]
+pub fn app_version() -> String {
+    gdrive_core::update::CURRENT_VERSION.to_owned()
+}
+
+#[tauri::command]
+pub async fn check_for_updates(state: State<'_, AppState>) -> CmdResult<()> {
+    simple(&state, Request::CheckForUpdates).await
+}
+
+/// Relaunches into the updated AppImage (after the daemon installed a new version).
+#[tauri::command]
+pub fn restart_app(app: tauri::AppHandle) {
+    crate::selfupdate::relaunch(&app);
+}
+
+#[tauri::command]
 pub async fn get_autostart() -> CmdResult<bool> {
     Ok(autostart::is_enabled())
 }

@@ -77,6 +77,7 @@ fn try_spawn() -> bool {
         // the app quits. A separate `--daemon` invocation gets a mount of its own.
         tracing::info!("starting daemon via {}", appimage.to_string_lossy());
         let mut cmd = Command::new(appimage);
+        gdrive_core::update::clean_appimage_launch(&mut cmd);
         cmd.arg("--daemon");
         cmd
     } else {

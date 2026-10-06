@@ -15,6 +15,7 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
 use crate::auth::{AuthRevoked, Authenticator};
+use crate::bandwidth::Bandwidth;
 
 const API: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
@@ -139,6 +140,7 @@ pub struct DriveClient {
     auth: Authenticator,
     api_base: String,
     upload_base: String,
+    bandwidth: Arc<Bandwidth>,
 }
 
 async fn error_from(resp: Response) -> anyhow::Error {
@@ -178,7 +180,18 @@ impl DriveClient {
 
     /// Like [`DriveClient::new`] but against other base URLs (used by tests with a fake Drive).
     pub fn with_endpoints(http: reqwest::Client, auth: Authenticator, api_base: &str, upload_base: &str) -> Self {
-        Self { http, auth, api_base: api_base.trim_end_matches('/').to_owned(), upload_base: upload_base.trim_end_matches('/').to_owned() }
+        Self {
+            http,
+            auth,
+            api_base: api_base.trim_end_matches('/').to_owned(),
+            upload_base: upload_base.trim_end_matches('/').to_owned(),
+            bandwidth: Arc::default(),
+        }
+    }
+
+    /// Rate limits and byte counters shared by every transfer made through this client.
+    pub fn bandwidth(&self) -> &Arc<Bandwidth> {
+        &self.bandwidth
     }
 
     /// Sends a request built by `build`, retrying on rate limits, server errors,
@@ -314,6 +327,7 @@ impl DriveClient {
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| ApiError::Offline(e.to_string()))?;
+            self.bandwidth.download.consume(chunk.len()).await;
             hasher.update(&chunk);
             file.write_all(&chunk).await?;
             progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
@@ -390,8 +404,16 @@ impl DriveClient {
 
         let file = tokio::fs::File::open(local).await?;
         let counter = progress.clone();
-        let stream = tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024).inspect_ok(move |chunk| {
-            counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        let bandwidth = self.bandwidth.clone();
+        // Small chunks keep throttled uploads smooth.
+        let stream = tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024).and_then(move |chunk| {
+            let counter = counter.clone();
+            let bandwidth = bandwidth.clone();
+            async move {
+                bandwidth.upload.consume(chunk.len()).await;
+                counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                Ok(chunk)
+            }
         });
         // The session URL is pre-authorized; a body stream can't be replayed, so failures
         // here bubble up and the engine retries the whole upload later.

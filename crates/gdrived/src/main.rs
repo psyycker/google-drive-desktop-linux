@@ -3,11 +3,14 @@
 //! Owns the sync engine's lifecycle (sign-in, sign-out, config changes) and
 //! serves the JSON IPC protocol on a Unix socket for the tray app and CLI.
 
+mod updater;
+
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Context, Result};
 use gdrive_core::auth::{self, Authenticator, Token};
+use gdrive_core::bandwidth::Bandwidth;
 use gdrive_core::config::{self, Config};
 use gdrive_core::db::Db;
 use gdrive_core::engine::{self, Command, EngineHandle};
@@ -22,7 +25,11 @@ struct Daemon {
     http: reqwest::Client,
     status: Arc<RwLock<Status>>,
     engine: Option<EngineHandle>,
+    /// Throttles of the running engine's Drive client, for live limit changes.
+    bandwidth: Option<Arc<Bandwidth>>,
     login: Option<tokio::task::JoinHandle<()>>,
+    /// Wakes the updater for an immediate check.
+    check_updates: Arc<tokio::sync::Notify>,
 }
 
 type Shared = Arc<Mutex<Daemon>>;
@@ -46,6 +53,7 @@ impl Daemon {
         };
         let auth = Authenticator::new(self.http.clone(), &self.config, token);
         let api = gdrive_core::api::DriveClient::new(self.http.clone(), auth);
+        self.bandwidth = Some(api.bandwidth().clone());
         let db = Db::open(&config::db_file())?;
         self.status.write().unwrap().sync_root = self.config.sync_root.display().to_string();
         self.engine = Some(engine::start(&self.config, api, db, self.status.clone()));
@@ -57,6 +65,7 @@ impl Daemon {
         if let Some(engine) = self.engine.take() {
             engine.stop().await;
         }
+        self.bandwidth = None;
     }
 
     /// Drops the handle of an engine that exited on its own (e.g. revoked sign-in).
@@ -88,6 +97,10 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
         Request::SyncNow => d.send(Command::SyncNow),
         Request::FullResync => d.send(Command::FullResync),
         Request::GetConfig => Response::Config { config: d.config.clone() },
+        Request::CheckForUpdates => {
+            d.check_updates.notify_one();
+            Response::Ok
+        }
         Request::SetConfig { config } => {
             apply_config(&mut d, config).await?;
             Response::Ok
@@ -104,7 +117,10 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
             Token::delete()?;
             Db::open(&config::db_file())?.reset()?;
             let root = d.config.sync_root.display().to_string();
-            *d.status.write().unwrap() = Status::new(SyncState::SignedOut, root);
+            let update = d.status.read().unwrap().update.clone();
+            let mut fresh = Status::new(SyncState::SignedOut, root);
+            fresh.update = update;
+            *d.status.write().unwrap() = fresh;
             tracing::info!("signed out");
             Response::Ok
         }
@@ -117,11 +133,34 @@ async fn apply_config(d: &mut Daemon, mut new: Config) -> Result<()> {
     if !new.sync_root.is_absolute() {
         bail!("the sync folder must be an absolute path");
     }
+    for limit in [&mut new.max_download_mb_per_sec, &mut new.max_upload_mb_per_sec] {
+        if !limit.is_finite() || *limit < 0.0 {
+            *limit = 0.0;
+        }
+    }
     if new == d.config {
         return Ok(());
     }
     let old = std::mem::replace(&mut d.config, new);
     d.config.save()?;
+
+    // Speed limits apply live; everything else restarts the engine.
+    let limits_only = Config {
+        max_download_mb_per_sec: d.config.max_download_mb_per_sec,
+        max_upload_mb_per_sec: d.config.max_upload_mb_per_sec,
+        ..old.clone()
+    } == d.config;
+    if let Some(bandwidth) = &d.bandwidth {
+        bandwidth.set_limits(d.config.max_download_mb_per_sec, d.config.max_upload_mb_per_sec);
+        if limits_only {
+            tracing::info!(
+                "speed limits now {} MB/s down, {} MB/s up (0 = unlimited)",
+                d.config.max_download_mb_per_sec,
+                d.config.max_upload_mb_per_sec
+            );
+            return Ok(());
+        }
+    }
     d.stop_engine().await;
     if old.client_id != d.config.client_id || old.client_secret != d.config.client_secret {
         // Refresh tokens are bound to the OAuth client that issued them.
@@ -198,6 +237,7 @@ fn bind_socket() -> Result<UnixListener> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    gdrive_core::update::mark_inherited_fds_cloexec();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -214,7 +254,17 @@ async fn main() -> Result<()> {
         .connect_timeout(std::time::Duration::from_secs(15))
         .read_timeout(std::time::Duration::from_secs(120))
         .build()?;
-    let daemon: Shared = Arc::new(Mutex::new(Daemon { config, http, status, engine: None, login: None }));
+    let check_updates = Arc::new(tokio::sync::Notify::new());
+    let daemon: Shared = Arc::new(Mutex::new(Daemon {
+        config,
+        http: http.clone(),
+        status,
+        engine: None,
+        bandwidth: None,
+        login: None,
+        check_updates: check_updates.clone(),
+    }));
+    tokio::spawn(updater::run(daemon.clone(), http, check_updates));
     {
         let mut d = daemon.lock().await;
         if let Err(e) = d.start_engine() {

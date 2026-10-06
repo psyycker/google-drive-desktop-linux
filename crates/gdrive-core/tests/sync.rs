@@ -352,3 +352,87 @@ async fn edge_cases() {
     assert_eq!(a, b);
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn speed_limits_throttle_transfers_and_speed_is_reported() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    let d = h.drive.clone();
+    let mb = |seed: u8| (0..1_000_000u32).map(|i| (i as u8).wrapping_mul(seed)).collect::<Vec<u8>>();
+    for (i, name) in ["a.bin", "b.bin", "c.bin"].into_iter().enumerate() {
+        d.add_file(name, ROOT, &mb(i as u8 + 3));
+    }
+    let config = gdrive_core::config::Config { max_download_mb_per_sec: 1.0, max_upload_mb_per_sec: 0.5, ..h.config() };
+
+    // 3 MB down at 1 MB/s, shared by 3 parallel transfers.
+    let start = std::time::Instant::now();
+    h.start_with(config);
+    let mut peak = 0;
+    h.wait("throttled downloads", T, |h| {
+        peak = peak.max(h.status().download_bps);
+        ["a.bin", "b.bin", "c.bin"].iter().all(|n| h.read(n).is_some())
+    })
+    .await;
+    let took = start.elapsed().as_secs_f64();
+    assert!(took >= 2.5, "3 MB at 1 MB/s finished in {took:.2}s");
+    assert!((700_000..=1_400_000).contains(&peak), "reported download speed {peak} B/s");
+
+    // 1.5 MB up at 0.5 MB/s.
+    let start = std::time::Instant::now();
+    h.write("up.bin", &mb(7)[..]);
+    h.write("up2.bin", &mb(9)[..500_000]);
+    h.wait("throttled uploads", T, |h| h.drive.find("up.bin").is_some() && h.drive.find("up2.bin").is_some()).await;
+    let took = start.elapsed().as_secs_f64();
+    assert!(took >= 2.5, "1.5 MB at 0.5 MB/s finished in {took:.2}s");
+    assert_eq!(h.drive.content("up.bin").unwrap(), mb(7));
+    h.stop().await;
+}
+
+/// Regression: a new file that can never be downloaded used to deadlock the engine
+/// (re-locking the DB mutex while recording the error), freezing all syncing and
+/// making the daemon hang on the next settings change.
+#[tokio::test(flavor = "multi_thread")]
+async fn undownloadable_file_is_reported_and_sync_continues() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    let d = h.drive.clone();
+    let bad = d.add_file("flagged.exe", ROOT, b"nope");
+    d.make_undownloadable(&bad);
+    d.add_file("good.txt", ROOT, b"fine");
+    h.start();
+    h.wait("error reported", T, |h| h.status().errors.iter().any(|e| e.path == "flagged.exe")).await;
+    h.wait("other file synced", T, |h| h.read("good.txt").as_deref() == Some(&b"fine"[..])).await;
+
+    // The engine must still be alive and responsive after the failure.
+    h.write("after.txt", b"later");
+    h.wait("upload after failure", T, |h| h.drive.find("after.txt").is_some()).await;
+
+    let start = std::time::Instant::now();
+    h.stop().await;
+    assert!(start.elapsed() < Duration::from_secs(6), "stop took {:?}", start.elapsed());
+}
+
+/// Regression: the work queue is in memory, so remote files not yet downloaded when
+/// the engine stopped mid-sync were never revisited after a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_during_initial_sync_finishes_the_download() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    let d = h.drive.clone();
+    let folder = d.add_folder("Big", ROOT);
+    let names: Vec<String> = (0..12).map(|i| format!("Big/f{i:02}.bin")).collect();
+    for i in 0..12u8 {
+        d.add_file(&format!("f{i:02}.bin"), &folder, &vec![i; 200_000]);
+    }
+    // Throttled so the engine is reliably stopped part-way through.
+    let slow = gdrive_core::config::Config { max_download_mb_per_sec: 0.5, ..h.config() };
+    h.start_with(slow);
+    h.wait("some files downloaded", T, |h| names.iter().any(|n| h.read(n).is_some())).await;
+    h.stop().await;
+    let done = names.iter().filter(|n| h.read(n).is_some()).count();
+    assert!(done < names.len(), "test needs an interrupted sync, but all {done} files finished");
+
+    h.start();
+    h.wait("all files after restart", T, |h| names.iter().all(|n| h.read(n).is_some())).await;
+    h.stop().await;
+}

@@ -252,6 +252,15 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Remote items with no synced row: never downloaded, or interrupted mid-sync.
+    pub fn unsynced_remote_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT r.id FROM remote r LEFT JOIN synced s ON s.id = r.id WHERE s.id IS NULL")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn all_remote_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT id FROM remote")?;
         let rows = stmt.query_map([], |r| r.get(0))?;

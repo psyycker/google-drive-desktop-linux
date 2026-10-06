@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod bandwidth;
 pub mod config;
 pub mod db;
 pub mod engine;
@@ -18,3 +19,4 @@ pub mod gdoc;
 pub mod ipc;
 pub mod local;
 pub mod status;
+pub mod update;

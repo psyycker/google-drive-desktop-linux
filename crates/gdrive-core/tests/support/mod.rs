@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -86,6 +86,8 @@ pub struct DriveState {
     sessions: HashMap<String, (Option<String>, Value)>,
     pub counters: Counters,
     pub fail_next: u32,
+    /// Files whose content Google refuses to serve (e.g. flagged as abusive).
+    pub undownloadable: HashSet<String>,
 }
 
 impl DriveState {
@@ -184,6 +186,9 @@ async fn get_file(State(st): State<St>, UrlPath(id): UrlPath<String>, Query(q): 
     if q.get("alt").map(String::as_str) == Some("media") {
         if !f.is_binary() {
             return api_error(StatusCode::FORBIDDEN, "native file");
+        }
+        if s.undownloadable.contains(&id) {
+            return api_error(StatusCode::FORBIDDEN, "This file has been identified as malware or spam");
         }
         s.counters.downloads += 1;
         return f.content.into_response();
@@ -362,6 +367,10 @@ impl FakeDrive {
         self.state.lock().unwrap().fail_next = n;
     }
 
+    pub fn make_undownloadable(&self, id: &str) {
+        self.state.lock().unwrap().undownloadable.insert(id.to_owned());
+    }
+
     // ----- "another device" mutations -----
 
     fn insert(&self, name: &str, parent: &str, mime: &str, content: &[u8]) -> String {
@@ -488,9 +497,13 @@ impl Harness {
     }
 
     pub fn start(&mut self) {
+        self.start_with(self.config());
+    }
+
+    pub fn start_with(&mut self, config: Config) {
         assert!(self.engine.is_none());
         let db = Db::open(&self.db_path).unwrap();
-        self.engine = Some(engine::start(&self.config(), self.drive.client(), db, self.status.clone()));
+        self.engine = Some(engine::start(&config, self.drive.client(), db, self.status.clone()));
     }
 
     pub async fn stop(&mut self) {

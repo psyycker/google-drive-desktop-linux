@@ -27,6 +27,8 @@ pub enum Request {
     StartLogin,
     /// Forget the account and all sync state. Local files are left in place.
     SignOut,
+    /// Check GitHub for a newer version now.
+    CheckForUpdates,
     GetConfig,
     SetConfig { config: Config },
 }

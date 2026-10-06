@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use gdrive_core::config::Config;
 use gdrive_core::gdoc;
 use gdrive_core::ipc::{self, Request, Response};
-use gdrive_core::status::{Direction, SyncState};
+use gdrive_core::status::{human_bytes, Direction, SyncState, UpdatePhase};
 
 #[derive(Parser)]
 #[command(name = "gdrive", version, about = "Control the gdrive-linux sync daemon")]
@@ -32,6 +32,8 @@ enum Cmd {
     Sync,
     /// Re-read the whole Drive and rescan the sync folder.
     Resync,
+    /// Check for a new version now (AppImage installs update themselves when idle).
+    Update,
     /// Sign in to a Google account (opens the browser).
     Login,
     /// Sign out and forget sync state (local files are kept).
@@ -53,22 +55,17 @@ enum ConfigCmd {
     Folder { path: PathBuf },
     /// Set the Drive polling interval in seconds.
     Poll { seconds: u64 },
+    /// Limit total transfer speed in MB/s (0 = unlimited). Applies immediately.
+    Limit {
+        /// Download limit in MB/s.
+        #[arg(long)]
+        down: Option<f64>,
+        /// Upload limit in MB/s.
+        #[arg(long)]
+        up: Option<f64>,
+    },
 }
 
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[i])
-    }
-}
 
 async fn status(recent: usize) -> Result<()> {
     let Response::Status { status: st } = ipc::call(&Request::Status).await? else { bail!("unexpected reply") };
@@ -97,8 +94,24 @@ async fn status(recent: usize) -> Result<()> {
         }
     }
     println!("Folder:   {}", st.sync_root);
+    if !st.version.is_empty() {
+        println!("Version:  {}", st.version);
+    }
+    if let Some(u) = &st.update {
+        let what = match u.phase {
+            UpdatePhase::Available if u.automatic => "available; installs when syncing is idle".to_owned(),
+            UpdatePhase::Available => format!("available: {}", u.release_url),
+            UpdatePhase::Downloading => format!("downloading ({} of {})", human_bytes(u.bytes_done), human_bytes(u.bytes_total)),
+            UpdatePhase::Installing => "installing".to_owned(),
+            UpdatePhase::Failed => format!("failed: {}", u.message.as_deref().unwrap_or("unknown error")),
+        };
+        println!("Update:   {} {what}", u.latest);
+    }
     if st.pending > 0 {
         println!("Pending:  {} item(s)", st.pending);
+    }
+    if let Some(speed) = st.speed_text() {
+        println!("Speed:    {speed}");
     }
     if let Some(t) = st.last_synced {
         println!("Synced:   {}", t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S"));
@@ -151,6 +164,10 @@ async fn main() -> Result<()> {
         Cmd::Resume => drop(ipc::call(&Request::Resume).await?),
         Cmd::Sync => drop(ipc::call(&Request::SyncNow).await?),
         Cmd::Resync => drop(ipc::call(&Request::FullResync).await?),
+        Cmd::Update => {
+            ipc::call(&Request::CheckForUpdates).await?;
+            println!("Checking for updates… run `gdrive status` in a few seconds to see the result.");
+        }
         Cmd::Login => {
             if let Response::LoginUrl { url } = ipc::call(&Request::StartLogin).await? {
                 println!("Opening your browser to sign in. If it didn't open, visit:\n\n  {url}\n");
@@ -183,6 +200,20 @@ async fn main() -> Result<()> {
         Cmd::Config { action: Some(ConfigCmd::Poll { seconds }) } => {
             update_config(|c| c.poll_interval_secs = seconds).await?
         }
+        Cmd::Config { action: Some(ConfigCmd::Limit { down, up }) } => {
+            if down.is_none() && up.is_none() {
+                bail!("pass --down and/or --up (MB/s, 0 = unlimited)");
+            }
+            update_config(|c| {
+                if let Some(d) = down {
+                    c.max_download_mb_per_sec = d;
+                }
+                if let Some(u) = up {
+                    c.max_upload_mb_per_sec = u;
+                }
+            })
+            .await?
+        }
         Cmd::Open { file } => open_link(&file)?,
     }
     Ok(())
@@ -190,7 +221,15 @@ async fn main() -> Result<()> {
 
 fn toml_display(c: &Config) -> String {
     format!(
-        "client_id = {:?}\nclient_secret = {:?}\nsync_root = {:?}\npoll_interval_secs = {}\nmax_concurrent_transfers = {}\nuse_local_trash = {}\nignore = {:?}\n",
-        c.client_id, c.client_secret, c.sync_root, c.poll_interval_secs, c.max_concurrent_transfers, c.use_local_trash, c.ignore
+        "client_id = {:?}\nclient_secret = {:?}\nsync_root = {:?}\npoll_interval_secs = {}\nmax_concurrent_transfers = {}\nmax_download_mb_per_sec = {}\nmax_upload_mb_per_sec = {}\nuse_local_trash = {}\nignore = {:?}\n",
+        c.client_id,
+        c.client_secret,
+        c.sync_root,
+        c.poll_interval_secs,
+        c.max_concurrent_transfers,
+        c.max_download_mb_per_sec,
+        c.max_upload_mb_per_sec,
+        c.use_local_trash,
+        c.ignore
     )
 }
