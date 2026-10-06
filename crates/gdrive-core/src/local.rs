@@ -4,7 +4,7 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use md5::{Digest, Md5};
 
@@ -161,6 +161,65 @@ pub fn rel_str(rel: &Path) -> String {
     rel.to_string_lossy().into_owned()
 }
 
+/// Prefix of the folders inside [`META_DIR`] that hold discarded local files
+/// waiting to be deleted (see [`discard_contents`]).
+const DISCARDED_PREFIX: &str = "discarded-";
+
+/// Refuses to wipe a folder that does not look like a sync root: `/`, the home
+/// folder or one of its parents, or a non-empty folder without our [`META_DIR`].
+pub fn check_discardable(root: &Path) -> Result<()> {
+    if !root.is_absolute() || root.parent().is_none() {
+        bail!("refusing to delete everything in {}", root.display());
+    }
+    if dirs::home_dir().is_some_and(|home| home.starts_with(root)) {
+        bail!("refusing to delete everything in {}: it contains your home folder", root.display());
+    }
+    if root.is_dir() && !root.join(META_DIR).is_dir() && std::fs::read_dir(root)?.next().is_some() {
+        bail!("{} does not look like a Google Drive sync folder; not deleting it", root.display());
+    }
+    Ok(())
+}
+
+/// Moves everything in `root` (except [`META_DIR`]) into a fresh folder inside
+/// [`META_DIR`], which sync ignores, and returns that folder. Renames are instant even
+/// for huge trees, so the slow delete can happen later with [`delete_discarded`].
+/// Entries that cannot be renamed (e.g. another mount) are deleted on the spot.
+pub fn discard_contents(root: &Path) -> Result<Option<PathBuf>> {
+    check_discardable(root)?;
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let target = root.join(META_DIR).join(format!("{DISCARDED_PREFIX}{}", stamp.as_nanos()));
+    std::fs::create_dir_all(&target)?;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == META_DIR {
+            continue;
+        }
+        if std::fs::rename(entry.path(), target.join(entry.file_name())).is_err() {
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    Ok(Some(target))
+}
+
+/// Permanently deletes every folder left by [`discard_contents`], including ones from
+/// an earlier run that was interrupted.
+pub fn delete_discarded(root: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(root.join(META_DIR)) else { return Ok(()) };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(DISCARDED_PREFIX) {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +229,39 @@ mod tests {
         assert_eq!(with_suffix("report.pdf", " (2)"), "report (2).pdf");
         assert_eq!(with_suffix("Makefile", " (2)"), "Makefile (2)");
         assert_eq!(with_suffix(".bashrc", " (2)"), ".bashrc (2)");
+    }
+
+    #[test]
+    fn discards_everything_but_the_meta_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Drive");
+        std::fs::create_dir_all(root.join(META_DIR).join("tmp")).unwrap();
+        std::fs::create_dir_all(root.join("docs/sub")).unwrap();
+        std::fs::write(root.join("docs/sub/a.txt"), "a").unwrap();
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+
+        let discarded = discard_contents(&root).unwrap().unwrap();
+        let left: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [META_DIR]);
+        assert!(discarded.join("docs/sub/a.txt").is_file());
+
+        delete_discarded(&root).unwrap();
+        assert!(!discarded.exists());
+        assert!(root.join(META_DIR).join("tmp").is_dir());
+    }
+
+    #[test]
+    fn refuses_to_discard_foreign_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("precious.txt"), "x").unwrap();
+        assert!(discard_contents(dir.path()).is_err());
+        assert!(dir.path().join("precious.txt").exists());
+        assert!(check_discardable(Path::new("/")).is_err());
+        if let Some(home) = dirs::home_dir() {
+            assert!(check_discardable(&home).is_err());
+        }
+        // A missing or empty folder is fine: there is nothing to lose.
+        assert!(discard_contents(&dir.path().join("missing")).unwrap().is_none());
     }
 
     #[test]

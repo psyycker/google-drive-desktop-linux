@@ -32,6 +32,13 @@ enum Cmd {
     Sync,
     /// Re-read the whole Drive and rescan the sync folder.
     Resync,
+    /// Delete everything in the sync folder and download the whole Drive again.
+    /// Local changes that were not uploaded yet are lost.
+    Redownload {
+        /// Confirm that the local files may be deleted.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Check for a new version now (AppImage installs update themselves when idle).
     Update,
     /// Sign in to a Google account (opens the browser).
@@ -164,6 +171,13 @@ async fn main() -> Result<()> {
         Cmd::Resume => drop(ipc::call(&Request::Resume).await?),
         Cmd::Sync => drop(ipc::call(&Request::SyncNow).await?),
         Cmd::Resync => drop(ipc::call(&Request::FullResync).await?),
+        Cmd::Redownload { yes } => {
+            if !yes {
+                bail!("this permanently deletes everything in your sync folder; run `gdrive redownload --yes` to confirm");
+            }
+            ipc::call(&Request::Redownload).await?;
+            println!("Sync folder cleared; downloading everything again.");
+        }
         Cmd::Update => {
             ipc::call(&Request::CheckForUpdates).await?;
             println!("Checking for updates… run `gdrive status` in a few seconds to see the result.");

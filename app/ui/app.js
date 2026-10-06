@@ -456,6 +456,8 @@ function renderAccountCard() {
   $('btn-signout').hidden = !acct;
   if (!acct) $('signout-confirm').hidden = true;
   $('btn-resync').disabled = !acct;
+  $('btn-redownload').disabled = !acct;
+  if (!acct) $('redownload-confirm').hidden = true;
 }
 
 function renderOnboarding() {
@@ -731,6 +733,18 @@ function bind() {
   }));
   onClick('btn-resync', (btn) => withBusy(btn, async () => {
     await run('full_resync', undefined, 'Full resync started');
+    await poll();
+  }));
+
+  // Dangerous.
+  $('btn-redownload').addEventListener('click', () => {
+    $('redownload-root').textContent = (status && status.sync_root) || 'your Google Drive folder';
+    $('redownload-confirm').hidden = false;
+  });
+  $('btn-redownload-cancel').addEventListener('click', () => { $('redownload-confirm').hidden = true; });
+  onClick('btn-redownload-confirm', (btn) => withBusy(btn, async () => {
+    await run('redownload', undefined, 'Folder cleared — downloading everything again');
+    $('redownload-confirm').hidden = true;
     await poll();
   }));
 

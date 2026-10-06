@@ -146,6 +146,8 @@ svg { display: block; }
 .btn-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
 .btn-danger:hover { filter: brightness(1.05); background: var(--danger); }
 @media (prefers-color-scheme: dark) { .btn-danger { color: #3b0907; } }
+.btn-danger-outline { color: var(--danger); border-color: var(--danger); }
+.btn-danger-outline:hover { background: var(--danger-soft); }
 .btn-ghost { border-color: transparent; background: transparent; color: var(--accent); }
 .btn-ghost:hover { background: var(--accent-soft); }
 .btn-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -225,6 +227,8 @@ svg { display: block; }
   padding: 14px 16px; margin-bottom: 12px;
 }
 .card h2 { margin: 0 0 12px; font-size: 13px; font-weight: 600; }
+.card.danger-zone { border-color: var(--danger); }
+.card.danger-zone h2 { color: var(--danger); }
 .field { margin-bottom: 12px; }
 .card > :last-child, #cred-home > #cred-block > :last-child { margin-bottom: 0; }
 #cred-slot details.help { margin-bottom: 12px; }

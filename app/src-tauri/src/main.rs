@@ -89,6 +89,7 @@ fn main() {
             commands::resume,
             commands::sync_now,
             commands::full_resync,
+            commands::redownload,
             commands::start_login,
             commands::sign_out,
             commands::get_config,

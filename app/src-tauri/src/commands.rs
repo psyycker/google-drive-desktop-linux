@@ -52,6 +52,11 @@ pub async fn full_resync(state: State<'_, AppState>) -> CmdResult<()> {
 }
 
 #[tauri::command]
+pub async fn redownload(state: State<'_, AppState>) -> CmdResult<()> {
+    simple(&state, Request::Redownload).await
+}
+
+#[tauri::command]
 pub async fn sign_out(state: State<'_, AppState>) -> CmdResult<()> {
     simple(&state, Request::SignOut).await
 }

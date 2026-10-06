@@ -23,6 +23,9 @@ pub enum Request {
     SyncNow,
     /// Re-list the whole Drive and rescan the whole sync folder.
     FullResync,
+    /// Permanently delete everything in the sync folder, forget the sync state (but
+    /// stay signed in) and download the whole Drive again from scratch.
+    Redownload,
     /// Begin the OAuth flow. Returns `LoginUrl`; the daemon also opens it in the browser.
     StartLogin,
     /// Forget the account and all sync state. Local files are left in place.

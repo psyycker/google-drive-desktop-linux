@@ -192,6 +192,24 @@
           </label>
         </div>
 
+        <div class="card danger-zone">
+          <h2>Dangerous</h2>
+          <div class="row-between">
+            <div>
+              <div>Redownload everything</div>
+              <div class="hint">Delete all files in your Google Drive folder and download the whole Drive again from scratch. You stay signed in.</div>
+            </div>
+            <button class="btn btn-sm btn-danger-outline" id="btn-redownload">Redownload…</button>
+          </div>
+          <div class="confirm" id="redownload-confirm" hidden>
+            <div>Permanently delete everything in <b class="selectable" id="redownload-root"></b> and download it all again? Changes that have not been uploaded to Drive yet will be lost.</div>
+            <div class="btn-row">
+              <button class="btn btn-sm" id="btn-redownload-cancel">Cancel</button>
+              <button class="btn btn-danger btn-sm" id="btn-redownload-confirm">Delete and redownload</button>
+            </div>
+          </div>
+        </div>
+
         <div class="savebar" id="savebar" hidden>
           <span>Unsaved changes</span>
           <div class="btn-row">

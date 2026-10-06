@@ -15,6 +15,7 @@ use gdrive_core::config::{self, Config};
 use gdrive_core::db::Db;
 use gdrive_core::engine::{self, Command, EngineHandle};
 use gdrive_core::ipc::{Request, Response};
+use gdrive_core::local;
 use gdrive_core::status::{Status, SyncState};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -109,6 +110,10 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
             let url = start_login(daemon, &mut d).await?;
             Response::LoginUrl { url }
         }
+        Request::Redownload => {
+            redownload(&mut d).await?;
+            Response::Ok
+        }
         Request::SignOut => {
             d.stop_engine().await;
             if let Some(login) = d.login.take() {
@@ -125,6 +130,32 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
             Response::Ok
         }
     })
+}
+
+/// Wipes the sync folder and the sync state, then restarts the engine, which sees an
+/// empty folder and a never-synced Drive and downloads everything again.
+async fn redownload(d: &mut Daemon) -> Result<()> {
+    let root = d.config.sync_root.clone();
+    local::check_discardable(&root)?;
+    d.stop_engine().await;
+    // Forget the state first: an engine started with the old state and an empty folder
+    // would take every missing file for a local delete and trash it on Drive.
+    Db::open(&config::db_file())?.reset()?;
+    let update = d.status.read().unwrap().update.clone();
+    let mut fresh = Status::new(SyncState::Starting, root.display().to_string());
+    fresh.update = update;
+    *d.status.write().unwrap() = fresh;
+    if let Err(e) = local::discard_contents(&root) {
+        d.set_state(SyncState::Error, Some(format!("Could not clear the sync folder: {e:#}")));
+        return Err(e);
+    }
+    tracing::info!("cleared {}; downloading everything again", root.display());
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = local::delete_discarded(&root) {
+            tracing::warn!("cannot delete discarded files: {e:#}");
+        }
+    });
+    d.start_engine()
 }
 
 async fn apply_config(d: &mut Daemon, mut new: Config) -> Result<()> {
