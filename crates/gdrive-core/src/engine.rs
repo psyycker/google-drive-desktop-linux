@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{ApiError, DriveClient, Progress, SHORTCUT_MIME};
+use crate::api::{ApiError, DriveClient, NotDownloadable, Progress, SHORTCUT_MIME};
 use crate::auth::AuthRevoked;
 use crate::bandwidth::SpeedMeter;
 use crate::config::{Config, META_DIR};
@@ -535,6 +535,7 @@ impl Engine {
             Some(id) => Work::Id(id.clone()),
             None => Work::Path(done.path.clone()),
         };
+        let succeeded = done.result.is_ok();
         match done.result {
             Ok(()) => {
                 self.retry.remove(&key);
@@ -551,11 +552,15 @@ impl Engine {
             }
             Err(e) => self.push_retry(key, Some(&e)),
         }
-        // Re-examine the item: it may have changed while the transfer ran.
-        if let Some(id) = done.id {
-            self.dirty_ids.insert(id);
+        // Re-examine the item: it may have changed while the transfer ran. A failed one
+        // comes back through its retry entry once the backoff is over; re-examining it
+        // now would start the transfer again straight away.
+        if succeeded {
+            if let Some(id) = done.id {
+                self.dirty_ids.insert(id);
+            }
+            self.dirty_paths.insert(done.path);
         }
-        self.dirty_paths.insert(done.path);
         self.schedule_reconcile(Duration::from_millis(200));
         self.refresh_status();
     }
@@ -575,10 +580,17 @@ impl Engine {
     }
 
     fn push_retry(&mut self, work: Work, err: Option<&anyhow::Error>) {
-        let entry = self.retry.entry(work.clone()).or_insert(Retry { attempts: 0, due: Instant::now() });
-        entry.attempts += 1;
-        let backoff = Duration::from_secs(5 * 2u64.pow(entry.attempts.min(9))).min(Duration::from_secs(1800));
-        entry.due = Instant::now() + backoff;
+        // Retrying can't help; the item is looked at again when it changes on Drive.
+        let retry_in = if err.is_some_and(|e| e.is::<NotDownloadable>()) {
+            self.retry.remove(&work);
+            None
+        } else {
+            let entry = self.retry.entry(work.clone()).or_insert(Retry { attempts: 0, due: Instant::now() });
+            entry.attempts += 1;
+            let backoff = Duration::from_secs(5 * 2u64.pow(entry.attempts.min(9))).min(Duration::from_secs(1800));
+            entry.due = Instant::now() + backoff;
+            Some(backoff)
+        };
         if let Some(e) = err {
             let path = match &work {
                 Work::Path(p) => rel_str(p),
@@ -592,7 +604,10 @@ impl Engine {
                     }
                 }
             };
-            tracing::warn!("{path}: {e:#} (retry in {backoff:?})");
+            match retry_in {
+                Some(backoff) => tracing::warn!("{path}: {e:#} (retry in {backoff:?})"),
+                None => tracing::warn!("{path}: {e:#} (not retrying until it changes on Drive)"),
+            }
             self.shared.status.write().unwrap().push_error(path, format!("{e:#}"));
         }
     }

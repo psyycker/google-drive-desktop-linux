@@ -452,3 +452,52 @@ async fn flagged_files_the_user_owns_are_downloaded_anyway() {
     assert!(h.status().errors.is_empty(), "{:?}", h.status().errors);
     h.stop().await;
 }
+
+/// Regression: a failed download was started again right away instead of after its
+/// retry backoff, so a file Drive kept refusing was re-requested in a tight loop.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_download_waits_for_its_backoff() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    let d = h.drive.clone();
+    let id = d.add_file("stubborn.bin", ROOT, b"eventually");
+    d.break_downloads(&id);
+    h.start();
+    h.wait("error reported", T, |h| h.status().errors.iter().any(|e| e.path == "stubborn.bin")).await;
+    // The first retry is due 10 s after the failure.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let refused = d.counters().refused_downloads;
+    assert_eq!(refused, 1, "download retried {refused} times within its backoff");
+
+    // Once Drive serves it again, the scheduled retry downloads it.
+    d.fix_downloads(&id);
+    h.wait("downloaded on retry", 30, |h| h.read("stubborn.bin").as_deref() == Some(&b"eventually"[..])).await;
+    assert!(h.status().errors.is_empty(), "{:?}", h.status().errors);
+    h.stop().await;
+}
+
+/// Files Drive will never serve to this account (flagged, and owned by someone else)
+/// are not retried until they change on Drive, and don't keep the engine from idling.
+#[tokio::test(flavor = "multi_thread")]
+async fn undownloadable_file_is_not_retried_until_it_changes() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    let d = h.drive.clone();
+    let id = d.add_file("flagged.exe", ROOT, b"v1");
+    d.make_undownloadable(&id);
+    h.start();
+    h.wait("error reported", T, |h| h.status().errors.iter().any(|e| e.path == "flagged.exe")).await;
+    h.settle().await;
+    let refused = d.counters().refused_downloads;
+    h.send(Command::SyncNow);
+    h.settle().await;
+    assert_eq!(d.counters().refused_downloads, refused, "retried a file Drive will never serve");
+    assert_eq!(h.status().errors.len(), 1, "the error stays listed");
+
+    // A change on Drive is worth another try.
+    d.state.lock().unwrap().undownloadable.remove(&id);
+    d.edit(&id, b"v2");
+    h.wait("downloaded after it changed", T, |h| h.read("flagged.exe").as_deref() == Some(&b"v2"[..])).await;
+    assert!(h.status().errors.is_empty(), "{:?}", h.status().errors);
+    h.stop().await;
+}

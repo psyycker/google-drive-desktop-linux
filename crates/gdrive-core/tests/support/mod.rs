@@ -72,6 +72,8 @@ pub struct Counters {
     pub creates: usize,
     pub patches: usize,
     pub trashes: usize,
+    /// Downloads refused with an error (flagged or broken files).
+    pub refused_downloads: usize,
     /// Mutating requests of any kind (uploads, creates, patches).
     pub writes: usize,
 }
@@ -90,6 +92,8 @@ pub struct DriveState {
     pub undownloadable: HashSet<String>,
     /// Files flagged as malware/spam that the user owns: downloadable with acknowledgeAbuse.
     pub flagged: HashSet<String>,
+    /// Files whose download always fails with an error that is not worth retrying at once.
+    pub broken: HashSet<String>,
 }
 
 impl DriveState {
@@ -198,7 +202,12 @@ async fn get_file(State(st): State<St>, UrlPath(id): UrlPath<String>, Query(q): 
         }
         let acknowledged = q.get("acknowledgeAbuse").map(String::as_str) == Some("true");
         if s.undownloadable.contains(&id) || (s.flagged.contains(&id) && !acknowledged) {
+            s.counters.refused_downloads += 1;
             return abusive_error();
+        }
+        if s.broken.contains(&id) {
+            s.counters.refused_downloads += 1;
+            return api_error(StatusCode::FORBIDDEN, "download refused");
         }
         s.counters.downloads += 1;
         return f.content.into_response();
@@ -383,6 +392,14 @@ impl FakeDrive {
 
     pub fn flag_as_abusive(&self, id: &str) {
         self.state.lock().unwrap().flagged.insert(id.to_owned());
+    }
+
+    pub fn break_downloads(&self, id: &str) {
+        self.state.lock().unwrap().broken.insert(id.to_owned());
+    }
+
+    pub fn fix_downloads(&self, id: &str) {
+        self.state.lock().unwrap().broken.remove(id);
     }
 
     // ----- "another device" mutations -----

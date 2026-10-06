@@ -121,6 +121,19 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+/// Drive will never serve this file to this account, so retrying cannot help until the
+/// file changes (e.g. its owner gets it unflagged).
+#[derive(Debug)]
+pub struct NotDownloadable(pub &'static str);
+
+impl std::fmt::Display for NotDownloadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for NotDownloadable {}
+
 impl ApiError {
     pub fn is_not_found(err: &anyhow::Error) -> bool {
         matches!(err.downcast_ref::<ApiError>(), Some(ApiError::Http { status, .. }) if *status == StatusCode::NOT_FOUND)
@@ -335,9 +348,10 @@ impl DriveClient {
                 self.send(|c| Ok(c.get(&url).query(&[("alt", "media"), ("acknowledgeAbuse", "true")])))
                     .await
                     .map_err(|e| match e.downcast_ref::<ApiError>() {
-                        Some(ApiError::Http { status, .. }) if *status == StatusCode::FORBIDDEN => anyhow::anyhow!(
-                            "Google flagged this file as malware or spam, and only its owner can download it"
-                        ),
+                        Some(ApiError::Http { status, .. }) if *status == StatusCode::FORBIDDEN => NotDownloadable(
+                            "Google flagged this file as malware or spam, and only its owner can download it",
+                        )
+                        .into(),
                         _ => e,
                     })?
             }
