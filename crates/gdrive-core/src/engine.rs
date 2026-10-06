@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use notify::Watcher;
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventKind, Watcher};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -23,7 +24,7 @@ use crate::api::{ApiError, DriveClient, Progress, SHORTCUT_MIME};
 use crate::auth::AuthRevoked;
 use crate::bandwidth::SpeedMeter;
 use crate::config::{Config, META_DIR};
-use crate::db::{Db, RemoteItem, SyncedItem};
+use crate::db::{Db, RemoteItem, RemoteLookup, SyncedItem};
 use crate::gdoc;
 use crate::local::{self, depth, rel_str, IgnoreRules, LocalStat};
 use crate::status::{Account, ActivityKind, Direction, Quota, Status, SyncState, Transfer};
@@ -339,7 +340,7 @@ impl Engine {
                     self.first_event_at = None;
                     if !self.paused && self.fatal.is_none() {
                         if self.last_full_scan.elapsed() > FULL_SCAN_INTERVAL {
-                            self.full_local_scan();
+                            self.full_scan();
                         }
                         match self.reconcile().await {
                             Ok(()) => self.offline = false,
@@ -404,14 +405,10 @@ impl Engine {
             _ => self.full_remote_listing().await?,
         }
         self.db().set_meta("email", &self.email)?;
-        // Recheck every synced item to catch changes made while we weren't running,
-        // and every remote item never synced: the work queue lives in memory, so after
-        // a crash or restart mid-sync this is the only way to finish the job.
-        let synced = self.db().all_synced()?;
-        self.dirty_ids.extend(synced.into_iter().map(|s| s.id));
-        let unsynced = self.db().unsynced_remote_ids()?;
-        self.dirty_ids.extend(unsynced);
-        self.full_local_scan();
+        // Catch changes made while we weren't running, and remote items never synced:
+        // the work queue lives in memory, so after a crash or restart mid-sync this is
+        // the only way to finish the job.
+        self.scan_for_changes()?;
         Ok(())
     }
 
@@ -466,7 +463,7 @@ impl Engine {
             Command::Resume | Command::SyncNow => {
                 self.paused = false;
                 if self.fatal.take().is_some() {
-                    self.full_local_scan();
+                    self.full_scan();
                 }
                 for r in self.retry.values_mut() {
                     r.due = Instant::now();
@@ -484,7 +481,7 @@ impl Engine {
                         if let Ok(ids) = ids {
                             self.dirty_ids.extend(ids);
                         }
-                        self.full_local_scan();
+                        self.full_scan();
                         self.schedule_reconcile(Duration::ZERO);
                     }
                     Err(e) => self.handle_cycle_error(e),
@@ -499,13 +496,17 @@ impl Engine {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::warn!("file watcher error: {e}; rescanning");
-                self.full_local_scan();
+                self.full_scan();
                 self.schedule_reconcile(DEBOUNCE);
                 return;
             }
         };
         if ev.need_rescan() {
-            self.full_local_scan();
+            self.full_scan();
+        }
+        // Reads (opening a file or listing a folder, including our own scans) change nothing.
+        if matches!(ev.kind, EventKind::Access(kind) if kind != AccessKind::Close(AccessMode::Write)) {
+            return;
         }
         let mut relevant = false;
         for path in ev.paths {
@@ -735,7 +736,7 @@ impl Engine {
 
     /// Local file name for a remote item: sanitized, with a link extension for
     /// native Google files, and a " (n)" suffix when Drive has duplicate names.
-    fn local_name(&self, db: &Db, item: &RemoteItem) -> Result<String> {
+    fn local_name(&self, db: &impl RemoteLookup, item: &RemoteItem) -> Result<String> {
         let base = |i: &RemoteItem| {
             let name = local::sanitize_name(&i.name);
             if i.is_native() {
@@ -764,10 +765,10 @@ impl Engine {
     /// (shared-with-me, trashed ancestor, shortcut, …) or is the root itself.
     fn remote_path(&self, id: &str) -> Result<Option<(RemoteItem, PathBuf)>> {
         let db = self.db();
-        self.remote_path_in(&db, id)
+        self.remote_path_in(&*db, id)
     }
 
-    fn remote_path_in(&self, db: &Db, id: &str) -> Result<Option<(RemoteItem, PathBuf)>> {
+    fn remote_path_in(&self, db: &impl RemoteLookup, id: &str) -> Result<Option<(RemoteItem, PathBuf)>> {
         let Some(item) = db.get_remote(id)? else { return Ok(None) };
         if item.id == self.root_id || item.mime == SHORTCUT_MIME {
             return Ok(None);
@@ -804,23 +805,87 @@ impl Engine {
 
     // ------------------------------------------------------------------ local tree
 
-    /// Marks every local path dirty (startup, watcher overflow, periodic safety net).
-    fn full_local_scan(&mut self) {
+    /// Safety net for missed events (watcher overflow, periodic): see `scan_for_changes`.
+    fn full_scan(&mut self) {
+        if let Err(e) = self.scan_for_changes() {
+            self.handle_cycle_error(e);
+        }
+    }
+
+    /// Compares the synced tree against Drive and the disk in bulk, and marks dirty
+    /// only the items that differ. Reconciling every item one by one instead costs a
+    /// dozen queries and stats each, which takes minutes on a large Drive.
+    fn scan_for_changes(&mut self) -> Result<()> {
         self.last_full_scan = Instant::now();
-        let ignore = &self.ignore;
-        let root = &self.root;
+        let started = std::time::Instant::now();
+        let (synced, remote) = {
+            let db = self.db();
+            (db.all_synced()?, db.remote_snapshot()?)
+        };
+        let mut remote_paths = HashMap::new();
+        for id in remote.ids() {
+            if let Some((_, path)) = self.remote_path_in(&remote, id)? {
+                remote_paths.insert(id, path);
+            }
+        }
+
+        // Local side: unknown paths are new (or renamed); known ones are compared by stat.
+        let by_path: HashMap<&Path, &SyncedItem> = synced.iter().map(|s| (s.rel_path.as_path(), s)).collect();
+        let mut unchanged_locally = HashSet::new();
+        let mut new_paths = 0;
+        let (ignore, root) = (&self.ignore, &self.root);
         let walker = walkdir::WalkDir::new(root).min_depth(1).follow_links(false).into_iter().filter_entry(|e| {
             e.path().strip_prefix(root).map(|rel| !ignore.is_ignored(rel)).unwrap_or(false)
         });
-        let mut n = 0;
         for entry in walker.flatten() {
-            if let Ok(rel) = entry.path().strip_prefix(root) {
-                self.dirty_paths.insert(rel.to_path_buf());
-                n += 1;
+            let Ok(rel) = entry.path().strip_prefix(root) else { continue };
+            let Some(l) = entry.metadata().ok().filter(|m| m.is_file() || m.is_dir()).map(|m| LocalStat::from_meta(&m))
+            else {
+                continue; // symlinks and special files are never synced
+            };
+            match by_path.get(rel) {
+                None => {
+                    self.dirty_paths.insert(rel.to_path_buf());
+                    new_paths += 1;
+                }
+                Some(s) => {
+                    let same = s.is_dir == l.is_dir
+                        && s.inode == l.inode
+                        && (s.is_dir || (s.size == l.size && s.mtime_ns == l.mtime_ns));
+                    if same {
+                        unchanged_locally.insert(s.id.as_str());
+                    }
+                }
             }
         }
-        tracing::debug!("local scan: {n} entries");
+
+        // Synced items changed on either side (or gone from one).
+        let mut changed = 0;
+        for s in &synced {
+            let unchanged = unchanged_locally.contains(s.id.as_str())
+                && remote_paths.get(s.id.as_str()).zip(remote.get(&s.id)).is_some_and(|(path, r)| {
+                    *path == s.rel_path
+                        && r.is_dir() == s.is_dir
+                        && (s.is_dir || r.is_native() || !remote_content_changed(s, r))
+                });
+            if !unchanged {
+                self.dirty_ids.insert(s.id.clone());
+                changed += 1;
+            }
+        }
+        // Drive items never synced.
+        let synced_ids: HashSet<&str> = synced.iter().map(|s| s.id.as_str()).collect();
+        let unsynced: Vec<String> =
+            remote_paths.into_keys().filter(|id| !synced_ids.contains(id)).map(str::to_owned).collect();
+        tracing::info!(
+            "scanned {} synced items in {:?}: {changed} changed, {new_paths} new local, {} not yet synced",
+            synced.len(),
+            started.elapsed(),
+            unsynced.len()
+        );
+        self.dirty_ids.extend(unsynced);
         self.schedule_reconcile(Duration::ZERO);
+        Ok(())
     }
 
     fn inflight_under(&self, dir: &Path) -> bool {
@@ -889,7 +954,7 @@ impl Engine {
                 .map(|id| {
                     let d = match db.get_synced(&id).ok().flatten() {
                         Some(s) => depth(&s.rel_path),
-                        None => self.remote_path_in(&db, &id).ok().flatten().map_or(0, |(_, p)| depth(&p)),
+                        None => self.remote_path_in(&*db, &id).ok().flatten().map_or(0, |(_, p)| depth(&p)),
                     };
                     (d, id)
                 })
@@ -1169,10 +1234,7 @@ impl Engine {
         }
 
         // 3. Content.
-        let remote_changed = match (&s.md5, &r.md5) {
-            (Some(a), Some(b)) => a != b,
-            _ => s.size != r.size,
-        };
+        let remote_changed = remote_content_changed(&s, &r);
         let mut local_md5 = None;
         let mut local_changed = local_changed;
         if local_changed {
@@ -1337,7 +1399,7 @@ impl Engine {
                 let mut adopt = None;
                 for candidate_name in remote_name_candidates(&name) {
                     for candidate in db.remote_named(&parent_id, &candidate_name)? {
-                        if db.get_synced(&candidate.id)?.is_none() && self.local_name(&db, &candidate)? == name {
+                        if db.get_synced(&candidate.id)?.is_none() && self.local_name(&*db, &candidate)? == name {
                             adopt = Some(candidate.id);
                         }
                     }
@@ -1445,6 +1507,14 @@ impl Engine {
             };
             let _ = done_tx.send(Done { path: rel, id, result });
         });
+    }
+}
+
+/// Whether a file's content on Drive differs from what was last synced.
+fn remote_content_changed(s: &SyncedItem, r: &RemoteItem) -> bool {
+    match (&s.md5, &r.md5) {
+        (Some(a), Some(b)) => a != b,
+        _ => s.size != r.size,
     }
 }
 

@@ -4,6 +4,7 @@
 //! UTF-8. Byte-wise BLOB ordering also makes subtree queries simple range scans:
 //! every descendant of `a/b` sorts between `a/b/` and `a/b0` ('0' is '/' + 1).
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -89,6 +90,42 @@ impl From<&DriveFile> for RemoteItem {
             mtime: f.modified_time,
             link: f.web_view_link.clone(),
         }
+    }
+}
+
+/// Read access to the remote tree: the database, or a snapshot of it.
+pub trait RemoteLookup {
+    fn get_remote(&self, id: &str) -> Result<Option<RemoteItem>>;
+    /// Children of `parent_id` called exactly `name`, ordered by id.
+    fn remote_named(&self, parent_id: &str, name: &str) -> Result<Vec<RemoteItem>>;
+}
+
+/// The whole remote tree in memory, for resolving every item's path at once
+/// without a query per item and per ancestor.
+pub struct RemoteSnapshot {
+    items: HashMap<String, RemoteItem>,
+    /// parent id → name → ids, ordered by id.
+    by_name: HashMap<String, HashMap<String, Vec<String>>>,
+}
+
+impl RemoteSnapshot {
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.items.keys().map(String::as_str)
+    }
+
+    pub fn get(&self, id: &str) -> Option<&RemoteItem> {
+        self.items.get(id)
+    }
+}
+
+impl RemoteLookup for RemoteSnapshot {
+    fn get_remote(&self, id: &str) -> Result<Option<RemoteItem>> {
+        Ok(self.items.get(id).cloned())
+    }
+
+    fn remote_named(&self, parent_id: &str, name: &str) -> Result<Vec<RemoteItem>> {
+        let ids = self.by_name.get(parent_id).and_then(|m| m.get(name));
+        Ok(ids.into_iter().flatten().filter_map(|id| self.items.get(id).cloned()).collect())
     }
 }
 
@@ -229,10 +266,22 @@ impl Db {
     }
 
     pub fn get_remote(&self, id: &str) -> Result<Option<RemoteItem>> {
-        Ok(self
-            .conn
-            .query_row(&format!("SELECT {REMOTE_COLS} FROM remote WHERE id = ?1"), [id], RemoteItem::from_row)
-            .optional()?)
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT {REMOTE_COLS} FROM remote WHERE id = ?1"))?;
+        Ok(stmt.query_row([id], RemoteItem::from_row).optional()?)
+    }
+
+    pub fn remote_snapshot(&self) -> Result<RemoteSnapshot> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {REMOTE_COLS} FROM remote ORDER BY id"))?;
+        let mut snap = RemoteSnapshot { items: HashMap::new(), by_name: HashMap::new() };
+        for item in stmt.query_map([], RemoteItem::from_row)? {
+            let item = item?;
+            if let Some(parent) = &item.parent_id {
+                let siblings = snap.by_name.entry(parent.clone()).or_default();
+                siblings.entry(item.name.clone()).or_default().push(item.id.clone());
+            }
+            snap.items.insert(item.id.clone(), item);
+        }
+        Ok(snap)
     }
 
     pub fn remote_children(&self, parent_id: &str) -> Result<Vec<RemoteItem>> {
@@ -249,15 +298,6 @@ impl Db {
             "SELECT {REMOTE_COLS} FROM remote WHERE parent_id = ?1 AND name = ?2 ORDER BY id"
         ))?;
         let rows = stmt.query_map([parent_id, name], RemoteItem::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// Remote items with no synced row: never downloaded, or interrupted mid-sync.
-    pub fn unsynced_remote_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT r.id FROM remote r LEFT JOIN synced s ON s.id = r.id WHERE s.id IS NULL")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -294,21 +334,13 @@ impl Db {
     }
 
     pub fn get_synced(&self, id: &str) -> Result<Option<SyncedItem>> {
-        Ok(self
-            .conn
-            .query_row(&format!("SELECT {SYNCED_COLS} FROM synced WHERE id = ?1"), [id], SyncedItem::from_row)
-            .optional()?)
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT {SYNCED_COLS} FROM synced WHERE id = ?1"))?;
+        Ok(stmt.query_row([id], SyncedItem::from_row).optional()?)
     }
 
     pub fn synced_by_path(&self, rel: &Path) -> Result<Option<SyncedItem>> {
-        Ok(self
-            .conn
-            .query_row(
-                &format!("SELECT {SYNCED_COLS} FROM synced WHERE rel_path = ?1"),
-                [path_bytes(rel)],
-                SyncedItem::from_row,
-            )
-            .optional()?)
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT {SYNCED_COLS} FROM synced WHERE rel_path = ?1"))?;
+        Ok(stmt.query_row([path_bytes(rel)], SyncedItem::from_row).optional()?)
     }
 
     pub fn synced_by_inode(&self, inode: u64) -> Result<Vec<SyncedItem>> {
@@ -369,6 +401,16 @@ impl Db {
             }
             Ok(())
         })
+    }
+}
+
+impl RemoteLookup for Db {
+    fn get_remote(&self, id: &str) -> Result<Option<RemoteItem>> {
+        Db::get_remote(self, id)
+    }
+
+    fn remote_named(&self, parent_id: &str, name: &str) -> Result<Vec<RemoteItem>> {
+        Db::remote_named(self, parent_id, name)
     }
 }
 
