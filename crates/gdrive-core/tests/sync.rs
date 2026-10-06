@@ -401,6 +401,8 @@ async fn undownloadable_file_is_reported_and_sync_continues() {
     d.add_file("good.txt", ROOT, b"fine");
     h.start();
     h.wait("error reported", T, |h| h.status().errors.iter().any(|e| e.path == "flagged.exe")).await;
+    let err = h.status().errors.into_iter().find(|e| e.path == "flagged.exe").unwrap();
+    assert!(err.message.contains("only its owner can download it"), "{}", err.message);
     h.wait("other file synced", T, |h| h.read("good.txt").as_deref() == Some(&b"fine"[..])).await;
 
     // The engine must still be alive and responsive after the failure.
@@ -434,5 +436,19 @@ async fn restart_during_initial_sync_finishes_the_download() {
 
     h.start();
     h.wait("all files after restart", T, |h| names.iter().all(|n| h.read(n).is_some())).await;
+    h.stop().await;
+}
+
+/// Files Google flagged as malware/spam are downloaded anyway when the user owns them.
+#[tokio::test(flavor = "multi_thread")]
+async fn flagged_files_the_user_owns_are_downloaded_anyway() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    let d = h.drive.clone();
+    let id = d.add_file("DeltaPatcherLite.exe", ROOT, b"MZ not really malware");
+    d.flag_as_abusive(&id);
+    h.start();
+    h.wait("flagged file downloaded", T, |h| h.read("DeltaPatcherLite.exe").as_deref() == Some(&b"MZ not really malware"[..])).await;
+    assert!(h.status().errors.is_empty(), "{:?}", h.status().errors);
     h.stop().await;
 }

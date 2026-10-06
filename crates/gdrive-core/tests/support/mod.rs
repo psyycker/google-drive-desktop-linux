@@ -86,8 +86,10 @@ pub struct DriveState {
     sessions: HashMap<String, (Option<String>, Value)>,
     pub counters: Counters,
     pub fail_next: u32,
-    /// Files whose content Google refuses to serve (e.g. flagged as abusive).
+    /// Files flagged as malware/spam that the user doesn't own: never downloadable.
     pub undownloadable: HashSet<String>,
+    /// Files flagged as malware/spam that the user owns: downloadable with acknowledgeAbuse.
+    pub flagged: HashSet<String>,
 }
 
 impl DriveState {
@@ -109,6 +111,13 @@ pub struct FakeDrive {
 }
 
 type St = Arc<Mutex<DriveState>>;
+
+/// What Drive returns for files it flagged as malware or spam.
+fn abusive_error() -> Response {
+    let msg = "This file has been identified as malware or spam and cannot be downloaded.";
+    let body = json!({"error": {"code": 403, "message": msg, "errors": [{"reason": "cannotDownloadAbusiveFile"}]}});
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
 
 fn api_error(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({"error": {"code": status.as_u16(), "message": msg, "errors": [{"reason": "fake"}]}}))).into_response()
@@ -187,8 +196,9 @@ async fn get_file(State(st): State<St>, UrlPath(id): UrlPath<String>, Query(q): 
         if !f.is_binary() {
             return api_error(StatusCode::FORBIDDEN, "native file");
         }
-        if s.undownloadable.contains(&id) {
-            return api_error(StatusCode::FORBIDDEN, "This file has been identified as malware or spam");
+        let acknowledged = q.get("acknowledgeAbuse").map(String::as_str) == Some("true");
+        if s.undownloadable.contains(&id) || (s.flagged.contains(&id) && !acknowledged) {
+            return abusive_error();
         }
         s.counters.downloads += 1;
         return f.content.into_response();
@@ -369,6 +379,10 @@ impl FakeDrive {
 
     pub fn make_undownloadable(&self, id: &str) {
         self.state.lock().unwrap().undownloadable.insert(id.to_owned());
+    }
+
+    pub fn flag_as_abusive(&self, id: &str) {
+        self.state.lock().unwrap().flagged.insert(id.to_owned());
     }
 
     // ----- "another device" mutations -----

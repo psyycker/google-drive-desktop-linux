@@ -129,6 +129,11 @@ impl ApiError {
     pub fn is_offline(err: &anyhow::Error) -> bool {
         matches!(err.downcast_ref::<ApiError>(), Some(ApiError::Offline(_)))
     }
+
+    /// Google refused the download because it flagged the file as malware or spam.
+    pub fn is_flagged_abusive(err: &anyhow::Error) -> bool {
+        matches!(err.downcast_ref::<ApiError>(), Some(ApiError::Http { reason, .. }) if reason == "cannotDownloadAbusiveFile")
+    }
 }
 
 /// Shared byte counter used to report transfer progress.
@@ -321,7 +326,23 @@ impl DriveClient {
     /// Streams a file's content to `dest` and returns the MD5 of what was written.
     pub async fn download(&self, id: &str, dest: &Path, progress: &Progress) -> Result<String> {
         let url = format!("{}/files/{id}", self.api_base);
-        let resp = self.send(|c| Ok(c.get(&url).query(&[("alt", "media")]))).await?;
+        let resp = match self.send(|c| Ok(c.get(&url).query(&[("alt", "media")]))).await {
+            // Everything in the user's Drive is theirs to keep, so files Google flagged
+            // as malware/spam are downloaded anyway. Drive only honours this for files
+            // the user owns.
+            Err(e) if ApiError::is_flagged_abusive(&e) => {
+                tracing::info!("{id}: flagged by Google as malware/spam; downloading anyway");
+                self.send(|c| Ok(c.get(&url).query(&[("alt", "media"), ("acknowledgeAbuse", "true")])))
+                    .await
+                    .map_err(|e| match e.downcast_ref::<ApiError>() {
+                        Some(ApiError::Http { status, .. }) if *status == StatusCode::FORBIDDEN => anyhow::anyhow!(
+                            "Google flagged this file as malware or spam, and only its owner can download it"
+                        ),
+                        _ => e,
+                    })?
+            }
+            other => other?,
+        };
         let mut file = tokio::fs::File::create(dest).await.with_context(|| format!("creating {}", dest.display()))?;
         let mut hasher = Md5::new();
         let mut stream = resp.bytes_stream();
