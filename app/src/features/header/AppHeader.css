@@ -1,0 +1,23 @@
+.header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px 10px;
+  background: var(--surface);
+}
+.avatar {
+  flex: none; width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center;
+  font-weight: 600; font-size: 16px; color: #fff;
+  background: var(--text-3);
+}
+.avatar svg { width: 20px; height: 20px; }
+.account { flex: 1; min-width: 0; }
+.account-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.account-email { color: var(--text-2); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.header-actions { display: flex; gap: 2px; }
+
+.quota { padding: 0 16px 12px; background: var(--surface); }
+.quota-bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.quota-fill { height: 100%; width: 0; border-radius: 3px; background: var(--accent); transition: width .4s ease; }
+.quota-fill.warn { background: var(--warn); }
+.quota-fill.full { background: var(--danger); }
+.quota-text { margin-top: 5px; font-size: 12px; color: var(--text-2); }

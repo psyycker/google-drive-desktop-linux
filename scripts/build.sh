@@ -6,9 +6,17 @@ cd "$(dirname "$0")/.."
 CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
 BOX="${GDRIVE_BOX:-gdrive-dev}"
 
+# The app embeds the built frontend (app/dist), so build it before the Rust side.
+build_frontend() {
+  scripts/frontend-deps.sh
+  npm --prefix app run build
+}
+
 if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+  build_frontend
   "$CARGO" build --release --workspace
 elif command -v distrobox >/dev/null && distrobox list 2>/dev/null | grep -q " $BOX "; then
+  build_frontend
   distrobox enter "$BOX" -- bash -lc "cd '$PWD' && '$CARGO' build --release --workspace"
 else
   echo "WebKitGTK dev headers not found and no '$BOX' distrobox; building daemon + CLI only." >&2

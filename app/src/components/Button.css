@@ -1,0 +1,35 @@
+.btn {
+  appearance: none; border: 1px solid var(--border); background: var(--surface);
+  color: var(--text); font: inherit; font-weight: 500;
+  padding: 7px 14px; border-radius: 8px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.btn:hover { background: var(--surface-2); }
+.btn:focus-visible { outline: none; box-shadow: var(--focus); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn-sm { padding: 5px 11px; font-size: 12.5px; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn-danger { background: var(--danger); border-color: var(--danger); color: var(--on-danger); }
+.btn-danger:hover { filter: brightness(1.05); background: var(--danger); }
+.btn-danger-outline { color: var(--danger); border-color: var(--danger); }
+.btn-danger-outline:hover { background: var(--danger-soft); }
+.btn-ghost { border-color: transparent; background: transparent; color: var(--accent); }
+.btn-ghost:hover { background: var(--accent-soft); }
+
+.btn-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.btn-row.end { justify-content: flex-end; }
+
+.link-btn { border: 0; background: none; color: var(--accent); font: inherit; cursor: pointer; padding: 0; }
+.link-btn:hover { text-decoration: underline; }
+
+.icon-btn {
+  width: 32px; height: 32px; border: 0; border-radius: 8px;
+  background: transparent; color: var(--text-2); cursor: pointer;
+  display: grid; place-items: center;
+}
+.icon-btn:hover { background: var(--surface-2); color: var(--text); }
+.icon-btn:focus-visible { outline: none; box-shadow: var(--focus); }
+.icon-btn:disabled { opacity: .5; cursor: default; background: transparent; }
+.icon-btn svg { width: 20px; height: 20px; }

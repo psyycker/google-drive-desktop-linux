@@ -1,4 +1,4 @@
-//! Tauri commands invoked from the frontend (`window.__TAURI__.core.invoke`).
+//! Tauri commands invoked from the frontend (wrapped in `app/src/api/commands.ts`).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

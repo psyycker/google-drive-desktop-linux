@@ -1,0 +1,14 @@
+.field { margin-bottom: 12px; }
+.field label { display: block; font-size: 12.5px; font-weight: 500; color: var(--text-2); margin-bottom: 5px; }
+.field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+.input-group { display: flex; gap: 6px; }
+.input-group input { flex: 1; min-width: 0; }
+
+.input-suffix { display: flex; align-items: center; gap: 8px; }
+.input-suffix input { flex: 1; min-width: 0; }
+.input-suffix span { color: var(--text-3); font-size: 12.5px; }
+
+.check { display: flex; align-items: flex-start; gap: 10px; margin: 4px 0 12px; cursor: pointer; }
+.check:last-child { margin-bottom: 0; }
+.check input { margin: 2px 0 0; width: 16px; height: 16px; accent-color: var(--accent); flex: none; }

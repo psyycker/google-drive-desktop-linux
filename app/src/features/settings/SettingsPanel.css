@@ -1,0 +1,2 @@
+/* Adds to the panel's own padding; the bottom leaves room for the save bar. */
+.settings { padding: 4px 12px 56px; }

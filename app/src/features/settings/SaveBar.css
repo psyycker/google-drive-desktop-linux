@@ -1,0 +1,8 @@
+.savebar {
+  position: fixed; left: 12px; right: 12px; bottom: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 12px 10px 16px; border-radius: 12px;
+  background: var(--surface); border: 1px solid var(--border); box-shadow: 0 6px 24px rgba(0, 0, 0, .18);
+  font-weight: 500;
+  animation: rise .18s ease-out;
+}

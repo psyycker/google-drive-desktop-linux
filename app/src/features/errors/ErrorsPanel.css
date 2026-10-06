@@ -1,0 +1,5 @@
+.error-msg {
+  font-size: 12px; color: var(--danger); margin-top: 2px;
+  white-space: normal; overflow-wrap: anywhere;
+  user-select: text; -webkit-user-select: text;
+}

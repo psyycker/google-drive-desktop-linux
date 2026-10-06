@@ -1,0 +1,25 @@
+.section-label {
+  padding: 10px 16px 4px; font-size: 11.5px; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--text-3);
+}
+
+.item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 16px; cursor: pointer;
+}
+.item:hover { background: var(--surface-2); }
+.item-icon {
+  flex: none; width: 32px; height: 32px; border-radius: 8px;
+  display: grid; place-items: center; background: var(--neutral-soft); color: var(--text-2);
+}
+.item-icon svg { width: 18px; height: 18px; }
+.item-icon.up { background: var(--accent-soft); color: var(--accent); }
+.item-icon.down { background: var(--success-soft); color: var(--success); }
+.item-icon.warn { background: var(--warn-soft); color: var(--warn); }
+.item-icon.danger { background: var(--danger-soft); color: var(--danger); }
+.item-main { flex: 1; min-width: 0; }
+.item-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.item-sub { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.item-sub .verb { color: var(--text-2); }
+.item-time { flex: none; font-size: 12px; color: var(--text-3); align-self: flex-start; margin-top: 2px; }
+.item .progress { margin: 5px 0 3px; }

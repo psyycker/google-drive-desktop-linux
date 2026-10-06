@@ -21,7 +21,8 @@ that open in the browser.
 | `crates/gdrive-core` | Sync engine, Drive API client, OAuth, state DB, IPC protocol |
 | `crates/gdrived` | The daemon; runs the engine and serves `$XDG_RUNTIME_DIR/gdrive-linux.sock` |
 | `crates/gdrive-cli` | `gdrive` command: status, pause/resume, login, config, `open file.gdoc` |
-| `app/` | Tauri app: tray icon (StatusNotifierItem via `ksni`) and status/settings window |
+| `app/src-tauri` | Tauri shell: tray icon (StatusNotifierItem via `ksni`) and the window's commands |
+| `app/src` | The status/settings window: React + TypeScript, built with Vite |
 
 ## How sync works
 
@@ -96,7 +97,7 @@ On Bazzite/Silverblue, the Tauri app is built inside a distrobox that has the
 WebKitGTK headers; the resulting binary runs on the host.
 
 ```sh
-# one-time: Rust + a build box with the Tauri dependencies
+# one-time: Rust, Node.js 20.19+ (for the window's frontend) and a build box with the Tauri dependencies
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 distrobox create --name gdrive-dev --image registry.fedoraproject.org/fedora-toolbox:44
 distrobox enter gdrive-dev -- sudo dnf install -y webkit2gtk4.1-devel gtk3-devel \
@@ -107,7 +108,12 @@ scripts/install.sh    # ~/.local/bin, systemd user service, desktop entries, .gd
 ```
 
 On a regular distro with `webkit2gtk4.1-devel` installed, `scripts/build.sh` builds
-directly. The tray icon needs a StatusNotifierItem host; on GNOME that's the
+directly. Both build the frontend into `app/dist` first, which the app binary embeds;
+a bare `cargo build -p gdrive-app` needs `npm --prefix app ci && npm --prefix app run build` beforehand.
+For UI work, `cd app && cargo tauri dev` serves the window from Vite with hot reload
+(quit the installed app first: only one instance runs at a time).
+
+The tray icon needs a StatusNotifierItem host; on GNOME that's the
 *AppIndicator and KStatusNotifierItem Support* extension (enabled by default on Bazzite/Ubuntu).
 
 ## 3. Set up and sign in

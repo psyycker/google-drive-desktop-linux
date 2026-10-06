@@ -1,0 +1,5 @@
+.confirm {
+  margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+  background: var(--danger-soft); display: grid; gap: 10px; font-size: 12.5px;
+}
+.confirm .btn-row { justify-content: flex-end; }

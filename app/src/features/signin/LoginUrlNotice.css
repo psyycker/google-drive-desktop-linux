@@ -1,0 +1,6 @@
+.login-url {
+  margin-top: 12px; padding: 10px 12px; border-radius: 8px; background: var(--surface-2);
+  font-size: 12px; color: var(--text-2);
+  user-select: text; -webkit-user-select: text;
+}
+.login-url .copy-field { margin-top: 6px; }

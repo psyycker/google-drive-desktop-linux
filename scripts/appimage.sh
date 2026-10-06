@@ -14,6 +14,8 @@ if ! pkg-config --exists webkit2gtk-4.1 2>/dev/null && [ -z "${GDRIVE_IN_BOX:-}"
 fi
 
 "$CARGO" tauri --version >/dev/null 2>&1 || "$CARGO" install tauri-cli --version '^2' --locked
+# `tauri build` runs the frontend build itself (beforeBuildCommand); it only needs the deps.
+scripts/frontend-deps.sh
 
 RUSTC="$(dirname "$CARGO")/rustc"
 [ -x "$RUSTC" ] || RUSTC=rustc

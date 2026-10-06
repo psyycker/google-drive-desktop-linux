@@ -1,0 +1,5 @@
+.empty { text-align: center; padding: 48px 32px; color: var(--text-2); }
+.empty-art { width: 56px; height: 56px; margin: 0 auto 12px; color: var(--text-3); }
+.empty-art svg { width: 56px; height: 56px; }
+.empty-title { font-weight: 600; color: var(--text); margin-bottom: 4px; }
+.empty-sub { font-size: 12.5px; }

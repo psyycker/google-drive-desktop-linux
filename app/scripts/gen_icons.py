@@ -2,7 +2,7 @@
 """Generates the app and tray icons for gdrive-app.
 
 Run from anywhere:  python3 app/scripts/gen_icons.py
-Writes into app/src-tauri/icons/ (plus app/ui/logo.png). Requires Pillow.
+Writes into app/src-tauri/icons/ (plus app/src/assets/logo.png). Requires Pillow.
 
 Everything is drawn at 8x and downsampled, which gives clean anti-aliased edges
 without needing an SVG renderer.
@@ -13,7 +13,7 @@ from pathlib import Path
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 OUT = Path(__file__).resolve().parent.parent / "src-tauri" / "icons"
-UI = Path(__file__).resolve().parent.parent / "ui"
+UI = Path(__file__).resolve().parent.parent / "src" / "assets"
 SS = 8  # supersampling factor
 
 BLUE = (66, 133, 244, 255)
