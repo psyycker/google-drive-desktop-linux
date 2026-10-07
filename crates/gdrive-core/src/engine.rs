@@ -230,6 +230,19 @@ struct Engine {
     upload_meter: SpeedMeter,
 }
 
+/// The local file went away before its upload finished. Nothing is left to upload; any
+/// deletion it stands for is picked up when its path is reconciled again.
+#[derive(Debug)]
+struct Vanished(String);
+
+impl std::fmt::Display for Vanished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} no longer exists", self.0)
+    }
+}
+
+impl std::error::Error for Vanished {}
+
 fn is_fatal(err: &anyhow::Error) -> bool {
     ApiError::is_offline(err) || err.is::<AuthRevoked>()
 }
@@ -540,6 +553,12 @@ impl Engine {
             Ok(()) => {
                 self.retry.remove(&key);
                 self.shared.status.write().unwrap().clear_error(&rel_str(&done.path));
+            }
+            Err(e) if e.is::<Vanished>() => {
+                tracing::debug!("{e}; skipping its upload");
+                self.retry.remove(&key);
+                self.shared.status.write().unwrap().clear_error(&rel_str(&done.path));
+                self.dirty_paths.insert(done.path.clone());
             }
             Err(e) if ApiError::is_not_found(&e) && done.id.is_some() => {
                 // Updating a file that's gone from Drive: forget it, so it's re-uploaded as new.
@@ -930,6 +949,7 @@ impl Engine {
 
         // Resolve dirty paths to synced items where possible.
         let mut unknown = Vec::new();
+        let mut gone = Vec::new();
         {
             let db = self.db();
             for p in paths {
@@ -940,7 +960,15 @@ impl Engine {
                     ids.insert(s.id);
                 } else if std::fs::symlink_metadata(self.root.join(&p)).is_ok() {
                     unknown.push(p);
+                } else {
+                    gone.push(p);
                 }
+            }
+        }
+        // Neither synced nor on disk any more: nothing left to retry.
+        for p in gone {
+            if self.retry.remove(&Work::Path(p.clone())).is_some() {
+                self.shared.status.write().unwrap().clear_error(&rel_str(&p));
             }
         }
         unknown.sort_by_key(|p| depth(p));
@@ -1612,16 +1640,34 @@ async fn run_upload(
     progress: &Progress,
 ) -> Result<()> {
     let abs = shared.root.join(rel);
+    let result = upload_file(shared, existing_id, parent_id, name, rel, &abs, md5, progress).await;
+    match result {
+        Err(_) if local::stat(&abs).is_none() => Err(Vanished(rel_str(rel)).into()),
+        r => r,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_file(
+    shared: &Shared,
+    existing_id: Option<&str>,
+    parent_id: &str,
+    name: &str,
+    rel: &Path,
+    abs: &Path,
+    md5: Option<String>,
+    progress: &Progress,
+) -> Result<()> {
     // Stat before reading: if the file changes mid-upload, the next pass sees a
     // newer mtime than what we record here and uploads again.
-    let before = local::stat(&abs).ok_or_else(|| anyhow!("{} vanished before upload", abs.display()))?;
+    let before = local::stat(abs).ok_or_else(|| Vanished(rel_str(rel)))?;
     let md5 = match md5 {
         Some(m) => m,
-        None => hash(&abs).await?,
+        None => hash(abs).await?,
     };
     let file = match existing_id {
-        Some(id) => shared.api.upload_update(id, &abs, before.mtime(), progress).await?,
-        None => shared.api.upload_new(name, parent_id, &abs, before.mtime(), progress).await?,
+        Some(id) => shared.api.upload_update(id, abs, before.mtime(), progress).await?,
+        None => shared.api.upload_new(name, parent_id, abs, before.mtime(), progress).await?,
     };
     shared.db().upsert_remote(&RemoteItem::from(&file))?;
     let recorded_md5 = file.md5_checksum.clone().or(Some(md5));

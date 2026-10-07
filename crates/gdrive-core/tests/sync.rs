@@ -522,3 +522,29 @@ async fn upload_outlasts_the_read_timeout() {
     assert!(started.elapsed() > Duration::from_secs(1), "upload too fast to exercise the timeout");
     assert_eq!(drive.content("big.bin").as_deref(), Some(&content[..]));
 }
+
+/// A file deleted while its upload waits for a free transfer slot is dropped quietly:
+/// no error is listed and it isn't retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_deleted_before_its_upload_starts_is_skipped() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    let config = gdrive_core::config::Config { max_upload_mb_per_sec: 0.25, max_concurrent_transfers: 1, ..h.config() };
+    h.start_with(config);
+    h.settle().await;
+
+    // 1.5 MB at 0.25 MB/s holds the only transfer slot for ~6 s.
+    h.write("big.bin", &vec![1u8; 1_500_000]);
+    h.wait("big upload started", T, |h| h.status().transfers.iter().any(|t| t.path == "big.bin")).await;
+    h.write("brief.txt", b"gone soon");
+    // Past the debounce, so brief.txt is queued behind big.bin.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(h.status().transfers.iter().any(|t| t.path == "big.bin"), "big.bin finished too early");
+    std::fs::remove_file(h.path("brief.txt")).unwrap();
+
+    h.wait("big uploaded", T, |h| h.drive.find("big.bin").is_some()).await;
+    h.settle().await;
+    assert!(h.status().errors.is_empty(), "{:?}", h.status().errors);
+    assert!(h.drive.find("brief.txt").is_none());
+    h.stop().await;
+}
