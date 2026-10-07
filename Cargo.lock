@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "gdrive-app"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "gdrive-cli"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "gdrive-core"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "gdrived"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gdrive-core",
