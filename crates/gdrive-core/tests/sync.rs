@@ -501,3 +501,24 @@ async fn undownloadable_file_is_not_retried_until_it_changes() {
     assert!(h.status().errors.is_empty(), "{:?}", h.status().errors);
     h.stop().await;
 }
+
+/// Regression: uploads went through the client's read timeout, which reqwest counts
+/// from the start of the request, so any upload longer than it failed and started over.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_outlasts_the_read_timeout() {
+    support::init_logs();
+    let drive = support::FakeDrive::start().await;
+    let http = reqwest::Client::builder().read_timeout(Duration::from_millis(500)).build().unwrap();
+    let api = drive.client_with(http);
+    api.bandwidth().upload.set_rate(200_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("big.bin");
+    let content = vec![7u8; 600_000];
+    std::fs::write(&local, &content).unwrap();
+
+    let started = std::time::Instant::now();
+    let progress = Default::default();
+    api.upload_new("big.bin", ROOT, &local, chrono::Utc::now(), &progress).await.unwrap();
+    assert!(started.elapsed() > Duration::from_secs(1), "upload too fast to exercise the timeout");
+    assert_eq!(drive.content("big.bin").as_deref(), Some(&content[..]));
+}

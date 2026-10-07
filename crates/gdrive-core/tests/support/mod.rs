@@ -368,7 +368,10 @@ impl FakeDrive {
     }
 
     pub fn client(&self) -> DriveClient {
-        let http = reqwest::Client::new();
+        self.client_with(reqwest::Client::new())
+    }
+
+    pub fn client_with(&self, http: reqwest::Client) -> DriveClient {
         let token = Token {
             refresh_token: "r".into(),
             access_token: "a".into(),

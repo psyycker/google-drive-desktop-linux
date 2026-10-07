@@ -21,6 +21,8 @@ const API: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
+/// An upload is abandoned once no body bytes have gone out for this long.
+const UPLOAD_STALL: Duration = Duration::from_secs(120);
 const FILE_FIELDS: &str = "id,name,mimeType,parents,md5Checksum,size,modifiedTime,trashed,webViewLink";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +157,9 @@ pub type Progress = Arc<AtomicU64>;
 #[derive(Clone)]
 pub struct DriveClient {
     http: reqwest::Client,
+    /// Sends upload bodies. It has no read timeout: reqwest's runs from the start of the
+    /// request until the response headers, so it would cut off any upload longer than it.
+    upload_http: reqwest::Client,
     auth: Authenticator,
     api_base: String,
     upload_base: String,
@@ -198,8 +203,14 @@ impl DriveClient {
 
     /// Like [`DriveClient::new`] but against other base URLs (used by tests with a fake Drive).
     pub fn with_endpoints(http: reqwest::Client, auth: Authenticator, api_base: &str, upload_base: &str) -> Self {
+        let upload_http = reqwest::Client::builder()
+            .user_agent(concat!("gdrive-linux/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .expect("failed to build the upload HTTP client");
         Self {
             http,
+            upload_http,
             auth,
             api_base: api_base.trim_end_matches('/').to_owned(),
             upload_base: upload_base.trim_end_matches('/').to_owned(),
@@ -452,14 +463,26 @@ impl DriveClient {
         });
         // The session URL is pre-authorized; a body stream can't be replayed, so failures
         // here bubble up and the engine retries the whole upload later.
-        let resp = self
-            .http
+        let put = self
+            .upload_http
             .put(&session)
             .header(header::CONTENT_LENGTH, size)
             .body(reqwest::Body::wrap_stream(stream))
-            .send()
-            .await
-            .map_err(|e| ApiError::Offline(e.to_string()))?;
+            .send();
+        tokio::pin!(put);
+        let mut last_sent = progress.load(Ordering::Relaxed);
+        let resp = loop {
+            tokio::select! {
+                r = &mut put => break r.map_err(|e| ApiError::Offline(e.to_string()))?,
+                _ = tokio::time::sleep(UPLOAD_STALL) => {
+                    let sent = progress.load(Ordering::Relaxed);
+                    if sent == last_sent {
+                        return Err(ApiError::Offline(format!("upload stalled for {UPLOAD_STALL:?}")).into());
+                    }
+                    last_sent = sent;
+                }
+            }
+        };
         if !resp.status().is_success() {
             return Err(error_from(resp).await);
         }
