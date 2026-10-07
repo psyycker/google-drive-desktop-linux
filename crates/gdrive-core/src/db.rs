@@ -40,7 +40,32 @@ CREATE TABLE IF NOT EXISTS synced (
     inode INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS synced_inode ON synced(inode);
+CREATE TABLE IF NOT EXISTS upload_sessions (
+    rel_path BLOB PRIMARY KEY,
+    url TEXT NOT NULL,
+    file_id TEXT,
+    parent_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    created INTEGER NOT NULL
+);
 ";
+
+/// A resumable upload in progress, kept so an interrupted upload continues where it
+/// stopped. It only applies while the local file and its destination are unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UploadSession {
+    pub rel_path: PathBuf,
+    pub url: String,
+    /// The Drive file being replaced, or `None` for a new file.
+    pub file_id: Option<String>,
+    pub parent_id: String,
+    pub name: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub created: DateTime<Utc>,
+}
 
 /// A file or folder as last reported by Drive.
 #[derive(Debug, Clone, PartialEq)]
@@ -199,7 +224,8 @@ impl Db {
 
     /// Drops all sync state (used on sign-out or when the sync folder changes).
     pub fn reset(&self) -> Result<()> {
-        self.conn.execute_batch("DELETE FROM meta; DELETE FROM remote; DELETE FROM synced;")?;
+        self.conn
+            .execute_batch("DELETE FROM meta; DELETE FROM remote; DELETE FROM synced; DELETE FROM upload_sessions;")?;
         Ok(())
     }
 
@@ -402,6 +428,50 @@ impl Db {
             Ok(())
         })
     }
+
+    // ----- upload sessions -----
+
+    pub fn get_upload_session(&self, rel: &Path) -> Result<Option<UploadSession>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT rel_path, url, file_id, parent_id, name, size, mtime_ns, created FROM upload_sessions WHERE rel_path = ?1",
+                [path_bytes(rel)],
+                |row| {
+                    Ok(UploadSession {
+                        rel_path: bytes_to_path(row.get(0)?),
+                        url: row.get(1)?,
+                        file_id: row.get(2)?,
+                        parent_id: row.get(3)?,
+                        name: row.get(4)?,
+                        size: row.get::<_, i64>(5)? as u64,
+                        mtime_ns: row.get(6)?,
+                        created: DateTime::from_timestamp(row.get(7)?, 0).unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn put_upload_session(&self, s: &UploadSession) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO upload_sessions (rel_path, url, file_id, parent_id, name, size, mtime_ns, created)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![path_bytes(&s.rel_path), s.url, s.file_id, s.parent_id, s.name, s.size as i64, s.mtime_ns, s.created.timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_upload_session(&self, rel: &Path) -> Result<()> {
+        self.conn.execute("DELETE FROM upload_sessions WHERE rel_path = ?1", [path_bytes(rel)])?;
+        Ok(())
+    }
+
+    /// Forgets sessions started before `cutoff` (Drive has expired them by now).
+    pub fn prune_upload_sessions(&self, cutoff: DateTime<Utc>) -> Result<()> {
+        self.conn.execute("DELETE FROM upload_sessions WHERE created < ?1", [cutoff.timestamp()])?;
+        Ok(())
+    }
 }
 
 impl RemoteLookup for Db {
@@ -432,6 +502,30 @@ mod tests {
         assert_eq!(ids, ["2", "3"]);
         db.delete_synced_subtree(Path::new("a")).unwrap();
         assert_eq!(db.synced_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn upload_sessions_round_trip_and_prune() {
+        let db = Db::in_memory().unwrap();
+        let created = Utc::now() - chrono::Duration::days(3);
+        let s = UploadSession {
+            rel_path: "dir/big.bin".into(),
+            url: "https://upload.example/s1".into(),
+            file_id: None,
+            parent_id: "p".into(),
+            name: "big.bin".into(),
+            size: 42,
+            mtime_ns: 7,
+            created,
+        };
+        db.put_upload_session(&s).unwrap();
+        let got = db.get_upload_session(Path::new("dir/big.bin")).unwrap().unwrap();
+        assert_eq!(got.url, s.url);
+        assert_eq!(got.created.timestamp(), created.timestamp());
+        db.prune_upload_sessions(Utc::now() - chrono::Duration::days(4)).unwrap();
+        assert!(db.get_upload_session(Path::new("dir/big.bin")).unwrap().is_some());
+        db.prune_upload_sessions(Utc::now() - chrono::Duration::days(2)).unwrap();
+        assert!(db.get_upload_session(Path::new("dir/big.bin")).unwrap().is_none());
     }
 
     #[test]

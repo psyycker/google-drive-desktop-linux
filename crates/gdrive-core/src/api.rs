@@ -12,7 +12,7 @@ use md5::{Digest, Md5};
 use reqwest::{header, Method, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::auth::{AuthRevoked, Authenticator};
 use crate::bandwidth::Bandwidth;
@@ -23,6 +23,9 @@ pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 /// An upload is abandoned once no body bytes have gone out for this long.
 const UPLOAD_STALL: Duration = Duration::from_secs(120);
+/// Consecutive interruptions without progress before an upload gives up for now. The
+/// session is kept, so the next attempt still continues where this one stopped.
+const UPLOAD_RESUMES: u32 = 5;
 const FILE_FIELDS: &str = "id,name,mimeType,parents,md5Checksum,size,modifiedTime,trashed,webViewLink";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +142,15 @@ impl std::error::Error for NotDownloadable {}
 impl ApiError {
     pub fn is_not_found(err: &anyhow::Error) -> bool {
         matches!(err.downcast_ref::<ApiError>(), Some(ApiError::Http { status, .. }) if *status == StatusCode::NOT_FOUND)
+    }
+
+    /// The network dropped or Drive had a passing failure: trying again can work.
+    pub fn is_transient(err: &anyhow::Error) -> bool {
+        match err.downcast_ref::<ApiError>() {
+            Some(ApiError::Offline(_)) => true,
+            Some(ApiError::Http { status, reason, .. }) => is_retryable(*status, reason),
+            None => false,
+        }
     }
 
     pub fn is_offline(err: &anyhow::Error) -> bool {
@@ -414,25 +426,31 @@ impl DriveClient {
 
     /// Uploads `local` as a new file in `parent`.
     pub async fn upload_new(&self, name: &str, parent: &str, local: &Path, mtime: DateTime<Utc>, progress: &Progress) -> Result<DriveFile> {
-        let meta = json!({ "name": name, "parents": [parent], "modifiedTime": mtime.to_rfc3339() });
-        self.resumable_upload(Method::POST, format!("{}/files", self.upload_base), meta, local, progress).await
+        let size = tokio::fs::metadata(local).await?.len();
+        let session = self.start_upload(&UploadTarget::New { name, parent }, size, mtime).await?;
+        self.upload_to_session(&session, local, Some(0), progress).await
     }
 
     /// Replaces the content of an existing file (keeps its revision history).
     pub async fn upload_update(&self, id: &str, local: &Path, mtime: DateTime<Utc>, progress: &Progress) -> Result<DriveFile> {
-        let meta = json!({ "modifiedTime": mtime.to_rfc3339() });
-        self.resumable_upload(Method::PATCH, format!("{}/files/{id}", self.upload_base), meta, local, progress).await
+        let size = tokio::fs::metadata(local).await?.len();
+        let session = self.start_upload(&UploadTarget::Update { id }, size, mtime).await?;
+        self.upload_to_session(&session, local, Some(0), progress).await
     }
 
-    async fn resumable_upload(
-        &self,
-        method: Method,
-        url: String,
-        meta: serde_json::Value,
-        local: &Path,
-        progress: &Progress,
-    ) -> Result<DriveFile> {
-        let size = tokio::fs::metadata(local).await?.len();
+    /// Opens a resumable upload session for `size` bytes and returns its URL. Drive keeps
+    /// a session for about a week; [`DriveClient::upload_to_session`] sends the content.
+    pub async fn start_upload(&self, target: &UploadTarget<'_>, size: u64, mtime: DateTime<Utc>) -> Result<String> {
+        let (method, url, meta) = match target {
+            UploadTarget::New { name, parent } => (
+                Method::POST,
+                format!("{}/files", self.upload_base),
+                json!({ "name": name, "parents": [parent], "modifiedTime": mtime.to_rfc3339() }),
+            ),
+            UploadTarget::Update { id } => {
+                (Method::PATCH, format!("{}/files/{id}", self.upload_base), json!({ "modifiedTime": mtime.to_rfc3339() }))
+            }
+        };
         let resp = self
             .send(|c| {
                 Ok(c.request(method.clone(), &url)
@@ -441,14 +459,89 @@ impl DriveClient {
                     .json(&meta))
             })
             .await?;
-        let session = resp
+        Ok(resp
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| anyhow!("upload session without Location header"))?
-            .to_owned();
+            .to_owned())
+    }
 
-        let file = tokio::fs::File::open(local).await?;
+    /// Sends `local` to an upload session, starting at `offset` when it is known (a fresh
+    /// session starts at 0) or wherever Drive says it got to otherwise. Interrupted
+    /// transfers continue from the last byte Drive stored instead of starting over.
+    pub async fn upload_to_session(&self, session: &str, local: &Path, offset: Option<u64>, progress: &Progress) -> Result<DriveFile> {
+        let before = tokio::fs::metadata(local).await?;
+        let mut offset = offset;
+        let mut failures = 0;
+        let mut high = progress.load(Ordering::Relaxed);
+        loop {
+            let result = self.upload_step(session, local, offset.take(), &before, progress).await;
+            // Bytes stored past the furthest point so far mean the transfer is moving.
+            let reached = progress.load(Ordering::Relaxed);
+            if reached > high {
+                high = reached;
+                failures = 0;
+            }
+            match result {
+                Ok(Some(file)) => return Ok(file),
+                // Drive stored part of the body without finishing: ask where it got to.
+                Ok(None) => {}
+                Err(e) if ApiError::is_transient(&e) && failures + 1 < UPLOAD_RESUMES => {
+                    failures += 1;
+                    tracing::debug!("upload interrupted, resuming: {e}");
+                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(failures))).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One pass of [`DriveClient::upload_to_session`]: find where the session stands
+    /// unless `offset` says, then send the rest.
+    async fn upload_step(
+        &self,
+        session: &str,
+        local: &Path,
+        offset: Option<u64>,
+        before: &std::fs::Metadata,
+        progress: &Progress,
+    ) -> Result<Option<DriveFile>> {
+        let size = before.len();
+        let start = match offset {
+            Some(n) => n,
+            None => match self.session_status(session, size).await? {
+                SessionState::Done(file) => return Ok(Some(file)),
+                SessionState::At(n) => n,
+            },
+        };
+        // Resuming with different content would corrupt the file on Drive.
+        let now = tokio::fs::metadata(local).await?;
+        if now.len() != size || now.modified().ok() != before.modified().ok() {
+            return Err(anyhow!("{} changed during upload", local.display()));
+        }
+        progress.store(start, Ordering::Relaxed);
+        self.send_from(session, local, start, size, progress).await
+    }
+
+    /// Asks Drive how much of an upload session's content it has stored.
+    async fn session_status(&self, session: &str, size: u64) -> Result<SessionState> {
+        let resp = self
+            .upload_http
+            .put(session)
+            .header(header::CONTENT_LENGTH, 0)
+            .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+            .send()
+            .await
+            .map_err(|e| ApiError::Offline(e.to_string()))?;
+        session_response(resp).await
+    }
+
+    /// Sends bytes `start..size` of `local`. `Ok(None)` means Drive answered before
+    /// storing everything.
+    async fn send_from(&self, session: &str, local: &Path, start: u64, size: u64, progress: &Progress) -> Result<Option<DriveFile>> {
+        let mut file = tokio::fs::File::open(local).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
         let counter = progress.clone();
         let bandwidth = self.bandwidth.clone();
         // Small chunks keep throttled uploads smooth.
@@ -461,14 +554,11 @@ impl DriveClient {
                 Ok(chunk)
             }
         });
-        // The session URL is pre-authorized; a body stream can't be replayed, so failures
-        // here bubble up and the engine retries the whole upload later.
-        let put = self
-            .upload_http
-            .put(&session)
-            .header(header::CONTENT_LENGTH, size)
-            .body(reqwest::Body::wrap_stream(stream))
-            .send();
+        let mut req = self.upload_http.put(session).header(header::CONTENT_LENGTH, size - start);
+        if size > 0 {
+            req = req.header(header::CONTENT_RANGE, format!("bytes {start}-{}/{size}", size - 1));
+        }
+        let put = req.body(reqwest::Body::wrap_stream(stream)).send();
         tokio::pin!(put);
         let mut last_sent = progress.load(Ordering::Relaxed);
         let resp = loop {
@@ -483,9 +573,57 @@ impl DriveClient {
                 }
             }
         };
-        if !resp.status().is_success() {
-            return Err(error_from(resp).await);
+        match session_response(resp).await? {
+            SessionState::Done(file) => Ok(Some(file)),
+            SessionState::At(_) => Ok(None),
         }
-        Ok(resp.json().await?)
     }
 }
+
+/// Which file an upload session writes to.
+pub enum UploadTarget<'a> {
+    New { name: &'a str, parent: &'a str },
+    Update { id: &'a str },
+}
+
+/// Drive no longer knows the upload session (they expire after about a week); a new one
+/// has to be started.
+#[derive(Debug)]
+pub struct SessionExpired;
+
+impl std::fmt::Display for SessionExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the upload session expired")
+    }
+}
+
+impl std::error::Error for SessionExpired {}
+
+enum SessionState {
+    Done(DriveFile),
+    /// Bytes stored so far; the upload continues from this offset.
+    At(u64),
+}
+
+async fn session_response(resp: Response) -> Result<SessionState> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(SessionState::Done(resp.json().await?));
+    }
+    if status == StatusCode::PERMANENT_REDIRECT {
+        // "Range: bytes=0-N" when N+1 bytes are stored; no header when none are.
+        let stored = resp
+            .headers()
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes=0-"))
+            .and_then(|n| n.parse::<u64>().ok())
+            .map_or(0, |last| last + 1);
+        return Ok(SessionState::At(stored));
+    }
+    if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+        return Err(SessionExpired.into());
+    }
+    Err(error_from(resp).await)
+}
+

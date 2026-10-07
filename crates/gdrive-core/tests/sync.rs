@@ -548,3 +548,72 @@ async fn file_deleted_before_its_upload_starts_is_skipped() {
     assert!(h.drive.find("brief.txt").is_none());
     h.stop().await;
 }
+
+/// A connection cut mid-upload continues from the last byte Drive stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_upload_resumes_where_it_stopped() {
+    support::init_logs();
+    let drive = support::FakeDrive::start().await;
+    let api = drive.client();
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("big.bin");
+    let content: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&local, &content).unwrap();
+    drive.cut_uploads(2, 1_000_000);
+
+    let progress = Default::default();
+    api.upload_new("big.bin", ROOT, &local, chrono::Utc::now(), &progress).await.unwrap();
+    assert_eq!(drive.content("big.bin").as_deref(), Some(&content[..]));
+    let c = drive.counters();
+    assert_eq!((c.sessions, c.uploads), (1, 1));
+    assert_eq!(c.upload_bytes, content.len(), "bytes were sent again");
+}
+
+/// Starts uploading `big.bin` through the engine, then stops it part-way through.
+async fn stop_mid_upload(h: &mut Harness, content: &[u8]) -> gdrive_core::config::Config {
+    let config = gdrive_core::config::Config { max_upload_mb_per_sec: 0.5, ..h.config() };
+    h.start_with(config.clone());
+    h.settle().await;
+    h.write("big.bin", content);
+    h.wait("upload under way", T, |h| h.drive.counters().upload_bytes >= 500_000).await;
+    h.stop().await;
+    let sent = h.drive.counters().upload_bytes;
+    assert!(sent < content.len(), "upload finished before the engine stopped");
+    config
+}
+
+/// An upload interrupted by a restart continues in the same session afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_resumes_after_restart() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    let content: Vec<u8> = (0..2_000_000u32).map(|i| (i % 253) as u8).collect();
+    let config = stop_mid_upload(&mut h, &content).await;
+
+    h.start_with(config);
+    h.wait("uploaded", 30, |h| h.drive.content("big.bin").as_deref() == Some(&content[..])).await;
+    h.settle().await;
+    let c = h.drive.counters();
+    assert_eq!((c.sessions, c.uploads), (1, 1));
+    assert_eq!(c.upload_bytes, content.len(), "bytes were sent again");
+    assert!(h.status().errors.is_empty(), "{:?}", h.status().errors);
+    h.stop().await;
+}
+
+/// A saved session Drive no longer knows is replaced by a new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_upload_session_starts_over() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    let content: Vec<u8> = (0..2_000_000u32).map(|i| (i % 241) as u8).collect();
+    let config = stop_mid_upload(&mut h, &content).await;
+    h.drive.expire_sessions();
+
+    h.start_with(config);
+    h.wait("uploaded", 30, |h| h.drive.content("big.bin").as_deref() == Some(&content[..])).await;
+    h.settle().await;
+    let c = h.drive.counters();
+    assert_eq!((c.sessions, c.uploads), (2, 1));
+    assert!(h.status().errors.is_empty(), "{:?}", h.status().errors);
+    h.stop().await;
+}

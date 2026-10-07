@@ -20,11 +20,11 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{ApiError, DriveClient, NotDownloadable, Progress, SHORTCUT_MIME};
+use crate::api::{ApiError, DriveClient, NotDownloadable, Progress, SessionExpired, UploadTarget, SHORTCUT_MIME};
 use crate::auth::AuthRevoked;
 use crate::bandwidth::SpeedMeter;
 use crate::config::{Config, META_DIR};
-use crate::db::{Db, RemoteItem, RemoteLookup, SyncedItem};
+use crate::db::{Db, RemoteItem, RemoteLookup, SyncedItem, UploadSession};
 use crate::gdoc;
 use crate::local::{self, depth, rel_str, IgnoreRules, LocalStat};
 use crate::status::{Account, ActivityKind, Direction, Quota, Status, SyncState, Transfer};
@@ -243,6 +243,12 @@ impl std::fmt::Display for Vanished {
 
 impl std::error::Error for Vanished {}
 
+/// Saved upload sessions older than this are not resumed: Drive expires them after
+/// about a week.
+fn upload_session_cutoff() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() - chrono::Duration::days(6)
+}
+
 fn is_fatal(err: &anyhow::Error) -> bool {
     ApiError::is_offline(err) || err.is::<AuthRevoked>()
 }
@@ -252,6 +258,9 @@ impl Engine {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         let root = config.sync_root.clone();
         api.bandwidth().set_limits(config.max_download_mb_per_sec, config.max_upload_mb_per_sec);
+        if let Err(e) = db.prune_upload_sessions(upload_session_cutoff()) {
+            tracing::warn!("pruning upload sessions: {e:#}");
+        }
         Self {
             shared: Arc::new(Shared {
                 root: root.clone(),
@@ -1641,10 +1650,17 @@ async fn run_upload(
 ) -> Result<()> {
     let abs = shared.root.join(rel);
     let result = upload_file(shared, existing_id, parent_id, name, rel, &abs, md5, progress).await;
-    match result {
+    let result = match result {
         Err(_) if local::stat(&abs).is_none() => Err(Vanished(rel_str(rel)).into()),
         r => r,
+    };
+    // Keep the session only when the next attempt can pick it up where this one stopped.
+    if result.as_ref().err().is_none_or(|e| !ApiError::is_transient(e)) {
+        if let Err(e) = shared.db().delete_upload_session(rel) {
+            tracing::warn!("{}: forgetting upload session: {e:#}", rel_str(rel));
+        }
     }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1665,13 +1681,56 @@ async fn upload_file(
         Some(m) => m,
         None => hash(abs).await?,
     };
-    let file = match existing_id {
-        Some(id) => shared.api.upload_update(id, abs, before.mtime(), progress).await?,
-        None => shared.api.upload_new(name, parent_id, abs, before.mtime(), progress).await?,
-    };
+    let file = send_upload(shared, existing_id, parent_id, name, rel, abs, &before, progress).await?;
     shared.db().upsert_remote(&RemoteItem::from(&file))?;
     let recorded_md5 = file.md5_checksum.clone().or(Some(md5));
     shared.record(&file.id, rel, recorded_md5, before)?;
     shared.activity(ActivityKind::Uploaded, rel, None);
     Ok(())
+}
+
+/// Sends the file's content, continuing a saved upload session for this exact file and
+/// destination when there is one, or starting (and saving) a new session otherwise.
+#[allow(clippy::too_many_arguments)]
+async fn send_upload(
+    shared: &Shared,
+    existing_id: Option<&str>,
+    parent_id: &str,
+    name: &str,
+    rel: &Path,
+    abs: &Path,
+    before: &LocalStat,
+    progress: &Progress,
+) -> Result<crate::api::DriveFile> {
+    let saved = shared.db().get_upload_session(rel)?.filter(|s| {
+        s.file_id.as_deref() == existing_id
+            && s.parent_id == parent_id
+            && s.name == name
+            && s.size == before.size
+            && s.mtime_ns == before.mtime_ns
+            && s.created > upload_session_cutoff()
+    });
+    if let Some(s) = saved {
+        tracing::info!("{}: resuming upload", rel_str(rel));
+        match shared.api.upload_to_session(&s.url, abs, None, progress).await {
+            Err(e) if e.is::<SessionExpired>() => tracing::info!("{}: upload session expired, starting over", rel_str(rel)),
+            r => return r,
+        }
+    }
+    let target = match existing_id {
+        Some(id) => UploadTarget::Update { id },
+        None => UploadTarget::New { name, parent: parent_id },
+    };
+    let url = shared.api.start_upload(&target, before.size, before.mtime()).await?;
+    shared.db().put_upload_session(&UploadSession {
+        rel_path: rel.to_path_buf(),
+        url: url.clone(),
+        file_id: existing_id.map(str::to_owned),
+        parent_id: parent_id.to_owned(),
+        name: name.to_owned(),
+        size: before.size,
+        mtime_ns: before.mtime_ns,
+        created: chrono::Utc::now(),
+    })?;
+    shared.api.upload_to_session(&url, abs, Some(0), progress).await
 }

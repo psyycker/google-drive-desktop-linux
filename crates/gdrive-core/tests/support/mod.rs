@@ -72,10 +72,22 @@ pub struct Counters {
     pub creates: usize,
     pub patches: usize,
     pub trashes: usize,
+    /// Upload sessions opened.
+    pub sessions: usize,
+    /// Content bytes received by upload sessions, counting any sent twice.
+    pub upload_bytes: usize,
     /// Downloads refused with an error (flagged or broken files).
     pub refused_downloads: usize,
     /// Mutating requests of any kind (uploads, creates, patches).
     pub writes: usize,
+}
+
+struct FSession {
+    existing: Option<String>,
+    meta: Value,
+    data: Vec<u8>,
+    /// The file written once the session completed.
+    done: Option<String>,
 }
 
 #[derive(Default)]
@@ -85,9 +97,12 @@ pub struct DriveState {
     changes: Vec<(u64, String)>,
     next_token: u64,
     next_id: u64,
-    sessions: HashMap<String, (Option<String>, Value)>,
+    sessions: HashMap<String, FSession>,
     pub counters: Counters,
     pub fail_next: u32,
+    /// Upload PUTs to cut off after `cut_uploads_after` bytes, as if the connection dropped.
+    pub cut_uploads: u32,
+    pub cut_uploads_after: usize,
     /// Files flagged as malware/spam that the user doesn't own: never downloadable.
     pub undownloadable: HashSet<String>,
     /// Files flagged as malware/spam that the user owns: downloadable with acknowledgeAbuse.
@@ -290,20 +305,76 @@ fn start_session(st: &St, base: &str, id: Option<String>, body: &Bytes) -> Respo
     }
     s.next_id += 1;
     let sid = format!("s{}", s.next_id);
-    s.sessions.insert(sid.clone(), (id, parse_body(body)));
+    s.sessions.insert(sid.clone(), FSession { existing: id, meta: parse_body(body), data: Vec::new(), done: None });
+    s.counters.sessions += 1;
     let mut headers = HeaderMap::new();
     headers.insert(header::LOCATION, format!("{base}/session/{sid}").parse().unwrap());
     (StatusCode::OK, headers).into_response()
 }
 
-async fn finish_session(State((st, _)): State<(St, String)>, UrlPath(sid): UrlPath<String>, body: Bytes) -> Response {
+/// What a resumable session answers once it has `stored` bytes but isn't complete.
+fn incomplete(stored: usize) -> Response {
+    let mut headers = HeaderMap::new();
+    if stored > 0 {
+        headers.insert(header::RANGE, format!("bytes=0-{}", stored - 1).parse().unwrap());
+    }
+    (StatusCode::PERMANENT_REDIRECT, headers).into_response()
+}
+
+/// Handles a PUT to an upload session: a status query (`Content-Range: bytes */N`),
+/// a chunk (`bytes a-b/N`), or the whole content (no Content-Range).
+async fn put_session(
+    State((st, _)): State<(St, String)>,
+    UrlPath(sid): UrlPath<String>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    let range = headers.get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let total: Option<usize> = range.as_deref().and_then(|r| r.rsplit('/').next()).and_then(|n| n.parse().ok());
+    let start: usize = match range.as_deref().and_then(|r| r.strip_prefix("bytes ")) {
+        Some(r) if r.starts_with('*') => {
+            let s = st.lock().unwrap();
+            let Some(sess) = s.sessions.get(&sid) else { return api_error(StatusCode::NOT_FOUND, "no session") };
+            return match &sess.done {
+                Some(id) => Json(s.files[id].json()).into_response(),
+                None => incomplete(sess.data.len()),
+            };
+        }
+        Some(r) => r.split('-').next().and_then(|n| n.parse().ok()).unwrap_or(0),
+        None => 0,
+    };
+    {
+        let s = st.lock().unwrap();
+        let Some(sess) = s.sessions.get(&sid) else { return api_error(StatusCode::NOT_FOUND, "no session") };
+        if sess.done.is_some() || start != sess.data.len() {
+            return api_error(StatusCode::BAD_REQUEST, "chunk does not continue the stored content");
+        }
+    }
+    let mut stream = body.into_data_stream();
+    let mut received = 0;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let Ok(chunk) = chunk else { return api_error(StatusCode::BAD_REQUEST, "body interrupted") };
+        let mut s = st.lock().unwrap();
+        s.counters.upload_bytes += chunk.len();
+        received += chunk.len();
+        s.sessions.get_mut(&sid).unwrap().data.extend_from_slice(&chunk);
+        if s.cut_uploads > 0 && received >= s.cut_uploads_after {
+            s.cut_uploads -= 1;
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "injected cut");
+        }
+    }
+
     let mut s = st.lock().unwrap();
-    let Some((existing, meta)) = s.sessions.remove(&sid) else { return api_error(StatusCode::NOT_FOUND, "no session") };
+    let sess = s.sessions.get(&sid).unwrap();
+    if total.is_some_and(|t| sess.data.len() < t) {
+        return incomplete(sess.data.len());
+    }
+    let (existing, meta, content) = (sess.existing.clone(), sess.meta.clone(), sess.data.clone());
     let modified = parse_time(&meta["modifiedTime"]).unwrap_or_else(Utc::now);
     let id = match existing {
         Some(id) => {
             let Some(f) = s.files.get_mut(&id) else { return api_error(StatusCode::NOT_FOUND, "File not found") };
-            f.content = body.to_vec();
+            f.content = content;
             f.modified = modified;
             id
         }
@@ -317,7 +388,7 @@ async fn finish_session(State((st, _)): State<(St, String)>, UrlPath(sid): UrlPa
                     .as_array()
                     .map(|a| a.iter().filter_map(|p| p.as_str().map(str::to_owned)).collect())
                     .unwrap_or_else(|| vec![ROOT.into()]),
-                content: body.to_vec(),
+                content,
                 modified,
                 trashed: false,
             };
@@ -325,6 +396,7 @@ async fn finish_session(State((st, _)): State<(St, String)>, UrlPath(sid): UrlPa
             id
         }
     };
+    s.sessions.get_mut(&sid).unwrap().done = Some(id.clone());
     s.record(&id);
     s.counters.uploads += 1;
     s.counters.writes += 1;
@@ -357,7 +429,7 @@ impl FakeDrive {
                     start_session(&st3, &ub2, Some(id), &body)
                 }),
             )
-            .route("/session/{sid}", put(finish_session))
+            .route("/session/{sid}", put(put_session))
             .with_state((state.clone(), up_base.clone()));
         let app = Router::new()
             .nest("/drive/v3", api)
@@ -383,6 +455,18 @@ impl FakeDrive {
 
     pub fn counters(&self) -> Counters {
         self.state.lock().unwrap().counters.clone()
+    }
+
+    /// Cuts the next `n` upload PUTs off after `after` bytes each.
+    pub fn cut_uploads(&self, n: u32, after: usize) {
+        let mut s = self.state.lock().unwrap();
+        s.cut_uploads = n;
+        s.cut_uploads_after = after;
+    }
+
+    /// Forgets every upload session, as Drive does once they expire.
+    pub fn expire_sessions(&self) {
+        self.state.lock().unwrap().sessions.clear();
     }
 
     pub fn fail_next(&self, n: u32) {
