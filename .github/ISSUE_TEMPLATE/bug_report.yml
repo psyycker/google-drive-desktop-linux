@@ -1,0 +1,31 @@
+name: Bug report
+description: Something isn't working
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `gdrive --version`
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distro, desktop and install method
+      placeholder: Fedora 44, GNOME, AppImage
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "`gdrive status` and `journalctl --user -u gdrived --since '10 min ago'`. Remove anything private."
+      render: text

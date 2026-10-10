@@ -1,10 +1,29 @@
 # gdrive-linux
 
+[![Release](https://img.shields.io/github/v/release/psyycker/google-drive-desktop-linux)](https://github.com/psyycker/google-drive-desktop-linux/releases)
+[![CI](https://github.com/psyycker/google-drive-desktop-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/psyycker/google-drive-desktop-linux/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**Google Drive for Linux.** Two-way sync, a tray icon, a status window and a CLI, with no
+mounts or FUSE. Written in Rust.
+
 A Google Drive for desktop–style client for Linux: it mirrors your whole **My Drive**
 into a local folder (`~/GoogleDrive` by default) and keeps both sides in sync —
 edits, renames, moves and deletions travel both ways, conflicts never lose data,
 and Google Docs/Sheets/Slides appear as `.gdoc`/`.gsheet`/`.gslides` link files
 that open in the browser.
+
+## Why this one?
+
+* **Real two-way sync** into a normal folder: any app can use your files, offline included.
+* **Safe by design:** conflicts keep both versions, deletions go to the trash on both sides, and a missing sync folder never wipes Drive.
+* **Native:** a Rust daemon (systemd user service) and a small Tauri tray app; no Electron, no FUSE.
+* **Easy to install:** single-file AppImage, `.deb`, `.rpm` and a headless CLI bundle for x86_64 and aarch64.
+* **Scriptable:** everything the window does is available from the `gdrive` CLI.
+
+Compared with the alternatives: `rclone` is an excellent general tool but has no tray, UI
+or live two-way watcher out of the box; Insync and similar clients are paid and closed
+source. This one is free, open source and focused only on Google Drive.
 
 ```
 ┌──────────────┐  JSON over Unix socket   ┌───────────────────────────────────────┐
@@ -141,6 +160,15 @@ gdrive logout            # forget the account (local files stay)
 journalctl --user -u gdrived -f   # daemon logs
 ```
 
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+If the project is useful to you, a star helps others find it.
+
+## License
+
+[MIT](LICENSE)
+
 ## Files
 
 | Path | Contents |
@@ -158,5 +186,4 @@ journalctl --user -u gdrived -f   # daemon logs
 * Remote changes arrive by polling (Drive push notifications need a public HTTPS
   endpoint), so they show up within the poll interval.
 * Files that appear in several folders on Drive (legacy multi-parent) are placed under their first parent.
-* Interrupted uploads restart from the beginning rather than resuming mid-file.
 * The refresh token is stored in a user-only file rather than the Secret Service keyring.
