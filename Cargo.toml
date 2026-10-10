@@ -6,7 +6,7 @@ members = ["crates/gdrive-core", "crates/gdrived", "crates/gdrive-cli", "app/src
 default-members = ["crates/gdrive-core", "crates/gdrived", "crates/gdrive-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 
