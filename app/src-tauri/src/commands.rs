@@ -150,15 +150,26 @@ pub async fn set_autostart(enabled: bool) -> CmdResult<()> {
 }
 
 fn spawn_xdg_open_checked(target: &str) -> CmdResult<()> {
-    let mut child = Command::new("xdg-open")
+    let mut cmd = Command::new("xdg-open");
+    // Inside an AppImage the inherited library/data paths point at our bundled copies,
+    // which breaks the file manager xdg-open launches.
+    gdrive_core::update::clean_appimage_launch(&mut cmd);
+    let child = cmd
         .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run xdg-open: {e}"))?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
+    let target = target.to_owned();
+    std::thread::spawn(move || match child.wait_with_output() {
+        Ok(out) if !out.status.success() => tracing::warn!(
+            "xdg-open {target} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("xdg-open {target}: {e}"),
+        _ => {}
     });
     Ok(())
 }
