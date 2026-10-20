@@ -281,6 +281,26 @@ async fn transient_api_failures_are_retried() {
     h.stop().await;
 }
 
+/// Drive's rate limit is per user: once one request is refused, the others have to wait
+/// too instead of each hammering Drive until it refuses them as well.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_holds_back_every_request() {
+    support::init_logs();
+    let drive = support::FakeDrive::start().await;
+    let client = drive.client();
+    drive.rate_limit_next(1);
+    let start = tokio::time::Instant::now();
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move { client.about().await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client.about().await.unwrap();
+    // The first request was refused, so the second waits out the backoff (at least 1 s).
+    assert!(start.elapsed() >= Duration::from_millis(900), "second request went out during the cooldown");
+    first.await.unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn edge_cases() {
     support::init_logs();

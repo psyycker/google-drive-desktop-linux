@@ -13,6 +13,7 @@ use reqwest::{header, Method, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::time::Instant;
 
 use crate::auth::{AuthRevoked, Authenticator};
 use crate::bandwidth::Bandwidth;
@@ -176,6 +177,9 @@ pub struct DriveClient {
     api_base: String,
     upload_base: String,
     bandwidth: Arc<Bandwidth>,
+    /// No request goes out before this instant. Drive's rate limits are per user, so once
+    /// one request is refused every transfer has to back off, not just the one that hit it.
+    cooldown: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 async fn error_from(resp: Response) -> anyhow::Error {
@@ -200,6 +204,17 @@ async fn error_from(resp: Response) -> anyhow::Error {
         Err(_) => (String::new(), text),
     };
     ApiError::Http { status, reason, message }.into()
+}
+
+fn is_rate_limited(status: StatusCode, reason: &str) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN && (reason == "rateLimitExceeded" || reason == "userRateLimitExceeded"))
+}
+
+/// How long the server asked us to wait, from a `Retry-After: <seconds>` header.
+fn retry_after(resp: &Response) -> Option<Duration> {
+    let secs = resp.headers().get(header::RETRY_AFTER)?.to_str().ok()?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs.min(300)))
 }
 
 fn is_retryable(status: StatusCode, reason: &str) -> bool {
@@ -227,12 +242,30 @@ impl DriveClient {
             api_base: api_base.trim_end_matches('/').to_owned(),
             upload_base: upload_base.trim_end_matches('/').to_owned(),
             bandwidth: Arc::default(),
+            cooldown: Arc::default(),
         }
     }
 
     /// Rate limits and byte counters shared by every transfer made through this client.
     pub fn bandwidth(&self) -> &Arc<Bandwidth> {
         &self.bandwidth
+    }
+
+    /// Waits out a rate-limit cooldown set by any request made through this client.
+    async fn wait_cooldown(&self) {
+        let until = *self.cooldown.lock().unwrap();
+        if let Some(until) = until {
+            tokio::time::sleep_until(until).await;
+        }
+    }
+
+    /// Holds back every request made through this client for at least `wait`.
+    fn start_cooldown(&self, wait: Duration) {
+        let until = Instant::now() + wait;
+        let mut cooldown = self.cooldown.lock().unwrap();
+        if cooldown.is_none_or(|c| c < until) {
+            *cooldown = Some(until);
+        }
     }
 
     /// Sends a request built by `build`, retrying on rate limits, server errors,
@@ -252,6 +285,7 @@ impl DriveClient {
                     e
                 }
             })?;
+            self.wait_cooldown().await;
             let result = build(&self.http)?.bearer_auth(token).send().await;
             let backoff = Duration::from_millis(500 * 2u64.pow(attempt.min(6)) + rand::random::<u64>() % 500);
             match result {
@@ -261,16 +295,24 @@ impl DriveClient {
                     self.auth.invalidate().await;
                 }
                 Ok(resp) => {
+                    let asked = retry_after(&resp);
                     let err = error_from(resp).await;
-                    let retry = match err.downcast_ref::<ApiError>() {
-                        Some(ApiError::Http { status, reason, .. }) => is_retryable(*status, reason),
-                        _ => false,
+                    let (retry, limited) = match err.downcast_ref::<ApiError>() {
+                        Some(ApiError::Http { status, reason, .. }) => (is_retryable(*status, reason), is_rate_limited(*status, reason)),
+                        _ => (false, false),
                     };
+                    if limited {
+                        self.start_cooldown(asked.unwrap_or(backoff).max(backoff));
+                    }
                     if !retry || attempt >= MAX_ATTEMPTS {
                         return Err(err);
                     }
                     tracing::debug!("retrying after {err}");
-                    tokio::time::sleep(backoff).await;
+                    if limited {
+                        self.wait_cooldown().await;
+                    } else {
+                        tokio::time::sleep(backoff).await;
+                    }
                 }
                 Err(e) if e.is_connect() || e.is_timeout() || e.is_request() => {
                     if attempt >= 3 {
@@ -490,7 +532,11 @@ impl DriveClient {
                 Err(e) if ApiError::is_transient(&e) && failures + 1 < UPLOAD_RESUMES => {
                     failures += 1;
                     tracing::debug!("upload interrupted, resuming: {e}");
-                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(failures))).await;
+                    let wait = Duration::from_millis(500 * 2u64.pow(failures));
+                    if matches!(e.downcast_ref::<ApiError>(), Some(ApiError::Http { status, reason, .. }) if is_rate_limited(*status, reason)) {
+                        self.start_cooldown(wait);
+                    }
+                    tokio::time::sleep(wait).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -554,6 +600,7 @@ impl DriveClient {
                 Ok(chunk)
             }
         });
+        self.wait_cooldown().await;
         let mut req = self.upload_http.put(session).header(header::CONTENT_LENGTH, size - start);
         if size > 0 {
             req = req.header(header::CONTENT_RANGE, format!("bytes {start}-{}/{size}", size - 1));

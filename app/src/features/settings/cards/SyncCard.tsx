@@ -1,10 +1,16 @@
 import { Card } from '../../../components/Card';
 import { Checkbox, Field, FieldPair, InputWithUnit } from '../../../components/Field';
+import { useSettings } from '../../../state/SettingsContext';
 import { FolderField } from '../FolderField';
 import { useSettingsFields } from '../useSettingsFields';
 
+/** Above this, bursts of small files tend to hit Drive's per-user rate limit. */
+const SAFE_CONCURRENCY = 5;
+
 export function SyncCard() {
   const { text, flag } = useSettingsFields();
+  const { form } = useSettings();
+  const manyTransfers = Number(form.concurrency) > SAFE_CONCURRENCY;
 
   return (
     <Card title="Sync">
@@ -19,6 +25,12 @@ export function SyncCard() {
           <input id="f-conc" type="number" min={1} max={16} step={1} {...text('concurrency')} />
         </Field>
       </FieldPair>
+      {manyTransfers && (
+        <p className="hint warn-text">
+          More than {SAFE_CONCURRENCY} parallel transfers can trip Google Drive's rate limit when syncing many small
+          files. Sync slows down while it backs off.
+        </p>
+      )}
       <FieldPair>
         <Field label="Download limit" htmlFor="f-down-limit">
           <InputWithUnit unit="MB/s">

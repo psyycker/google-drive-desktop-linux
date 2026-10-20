@@ -27,6 +27,7 @@ input:focus, textarea:focus { border-color: var(--accent); box-shadow: var(--foc
 textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; }
 
 .hint { font-size: 12px; color: var(--text-3); margin: 0; }
+.hint.warn-text { color: var(--warn); margin: -4px 0 12px; }
 .hint-inline { font-weight: 400; color: var(--text-3); }
 .muted { color: var(--text-2); }
 

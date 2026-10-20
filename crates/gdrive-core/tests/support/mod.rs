@@ -100,6 +100,8 @@ pub struct DriveState {
     sessions: HashMap<String, FSession>,
     pub counters: Counters,
     pub fail_next: u32,
+    /// Requests to refuse with Drive's per-user rate-limit error.
+    pub rate_limit_next: u32,
     /// Upload PUTs to cut off after `cut_uploads_after` bytes, as if the connection dropped.
     pub cut_uploads: u32,
     pub cut_uploads_after: usize,
@@ -148,6 +150,11 @@ async fn faults(State(st): State<St>, req: Request, next: Next) -> Response {
         if s.fail_next > 0 {
             s.fail_next -= 1;
             return api_error(StatusCode::SERVICE_UNAVAILABLE, "injected failure");
+        }
+        if s.rate_limit_next > 0 {
+            s.rate_limit_next -= 1;
+            let body = json!({"error": {"code": 403, "message": "User rate limit exceeded.", "errors": [{"reason": "userRateLimitExceeded"}]}});
+            return (StatusCode::FORBIDDEN, Json(body)).into_response();
         }
     }
     next.run(req).await
@@ -471,6 +478,10 @@ impl FakeDrive {
 
     pub fn fail_next(&self, n: u32) {
         self.state.lock().unwrap().fail_next = n;
+    }
+
+    pub fn rate_limit_next(&self, n: u32) {
+        self.state.lock().unwrap().rate_limit_next = n;
     }
 
     pub fn make_undownloadable(&self, id: &str) {
