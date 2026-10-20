@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// User configuration, stored at `~/.config/gdrive-linux/config.toml`.
@@ -28,6 +28,28 @@ pub struct Config {
     pub max_upload_mb_per_sec: f64,
     /// Install new versions automatically when syncing is idle (AppImage only).
     pub auto_update: bool,
+    /// Other disks that can hold some of the Drive's folders.
+    pub locations: Vec<StorageLocation>,
+    /// Drive folders kept on one of `locations` instead of under `sync_root`. Only the
+    /// daemon changes these, as it moves the files.
+    pub placements: Vec<Placement>,
+}
+
+/// A folder on another disk, e.g. an SSD, that mirrors part of the Drive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageLocation {
+    pub name: String,
+    pub root: PathBuf,
+}
+
+/// A Drive folder (and everything in it) kept at `<location root>/<folder>`, with a
+/// symlink to it left at `<sync_root>/<folder>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Placement {
+    /// Path relative to the Drive root, e.g. `Gaming`.
+    pub folder: PathBuf,
+    /// Name of the [`StorageLocation`].
+    pub location: String,
 }
 
 impl Default for Config {
@@ -43,6 +65,8 @@ impl Default for Config {
             max_download_mb_per_sec: 0.0,
             max_upload_mb_per_sec: 0.0,
             auto_update: true,
+            locations: Vec::new(),
+            placements: Vec::new(),
         }
     }
 }
@@ -50,6 +74,45 @@ impl Default for Config {
 impl Config {
     pub fn is_complete(&self) -> bool {
         !self.client_id.trim().is_empty() && !self.client_secret.trim().is_empty()
+    }
+
+    pub fn location(&self, name: &str) -> Option<&StorageLocation> {
+        self.locations.iter().find(|l| l.name == name)
+    }
+
+    /// Checks that storage locations and placements make sense together.
+    pub fn validate_storage(&self) -> Result<()> {
+        for (i, loc) in self.locations.iter().enumerate() {
+            if loc.name.trim().is_empty() {
+                bail!("every storage location needs a name");
+            }
+            if !loc.root.is_absolute() {
+                bail!("the folder of storage location \"{}\" must be an absolute path", loc.name);
+            }
+            if overlaps(&loc.root, &self.sync_root) {
+                bail!("storage location \"{}\" can't be inside or around the Google Drive folder", loc.name);
+            }
+            for other in &self.locations[..i] {
+                if other.name == loc.name {
+                    bail!("two storage locations are called \"{}\"", loc.name);
+                }
+                if overlaps(&other.root, &loc.root) {
+                    bail!("storage locations \"{}\" and \"{}\" overlap", other.name, loc.name);
+                }
+            }
+        }
+        for (i, p) in self.placements.iter().enumerate() {
+            if p.folder.as_os_str().is_empty() || !p.folder.is_relative() {
+                bail!("{} is not a folder inside the Drive", p.folder.display());
+            }
+            if self.location(&p.location).is_none() {
+                bail!("{} is kept on \"{}\", which is not a storage location", p.folder.display(), p.location);
+            }
+            if let Some(other) = self.placements[..i].iter().find(|o| overlaps(&o.folder, &p.folder)) {
+                bail!("{} and {} can't both be on other drives: one is inside the other", other.folder.display(), p.folder.display());
+            }
+        }
+        Ok(())
     }
 
     pub fn load() -> Result<Self> {
@@ -118,4 +181,9 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     f.sync_all()?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Whether one path is the other or inside it.
+pub fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
 }

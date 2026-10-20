@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use gdrive_core::config::Config;
+use gdrive_core::config::{Config, StorageLocation};
 use gdrive_core::gdoc;
 use gdrive_core::ipc::{self, Request, Response};
 use gdrive_core::status::{human_bytes, Direction, SyncState, UpdatePhase};
@@ -52,6 +52,13 @@ enum Cmd {
     },
     /// Open a .gdoc/.gsheet/… link file in the browser.
     Open { file: PathBuf },
+    /// Move a Drive folder to another drive (see `gdrive config location`), or back.
+    Move {
+        /// The folder: a path inside the Drive folder, or relative to the Drive root.
+        folder: PathBuf,
+        /// Name of the storage location, or `main` for the main Drive folder.
+        to: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -71,6 +78,21 @@ enum ConfigCmd {
         #[arg(long)]
         up: Option<f64>,
     },
+    /// Manage other drives that can hold some Drive folders.
+    Location {
+        #[command(subcommand)]
+        action: LocationCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocationCmd {
+    /// Add a folder on another drive, e.g. `gdrive config location add SSD /mnt/ssd/GDrive`.
+    Add { name: String, path: PathBuf },
+    /// Remove a storage location (its folders must be moved back first).
+    Remove { name: String },
+    /// List storage locations and the folders on them.
+    List,
 }
 
 
@@ -113,6 +135,11 @@ async fn status(recent: usize) -> Result<()> {
             UpdatePhase::Failed => format!("failed: {}", u.message.as_deref().unwrap_or("unknown error")),
         };
         println!("Update:   {} {what}", u.latest);
+    }
+    if let Some(r) = &st.relocation {
+        let to = r.to.as_deref().unwrap_or("main drive");
+        let pct = (r.bytes_done * 100).checked_div(r.bytes_total).map(|p| format!(" {p}%")).unwrap_or_default();
+        println!("Moving:   {} → {to}{pct}", r.folder);
     }
     if st.pending > 0 {
         println!("Pending:  {} item(s)", st.pending);
@@ -229,12 +256,44 @@ async fn main() -> Result<()> {
             .await?
         }
         Cmd::Open { file } => open_link(&file)?,
+        Cmd::Config { action: Some(ConfigCmd::Location { action }) } => match action {
+            LocationCmd::Add { name, path } => {
+                let root = std::path::absolute(path)?;
+                update_config(|c| c.locations.push(StorageLocation { name, root })).await?
+            }
+            LocationCmd::Remove { name } => update_config(|c| c.locations.retain(|l| l.name != name)).await?,
+            LocationCmd::List => {
+                let Response::Config { config } = ipc::call(&Request::GetConfig).await? else { bail!("unexpected reply") };
+                print!("{}", locations_display(&config));
+            }
+        },
+        Cmd::Move { folder, to } => {
+            // A path that exists locally is taken as one; anything else is Drive-relative.
+            let folder = if folder.exists() { std::path::absolute(folder)? } else { folder };
+            let location = (to != "main").then_some(to);
+            ipc::call(&Request::Relocate { folder, location }).await?;
+            println!("Moving; follow along with `gdrive status`.");
+        }
     }
     Ok(())
 }
 
+fn locations_display(c: &Config) -> String {
+    if c.locations.is_empty() {
+        return "No storage locations. Add one with `gdrive config location add <name> <path>`.\n".into();
+    }
+    let mut out = String::new();
+    for l in &c.locations {
+        out.push_str(&format!("{}  {}\n", l.name, l.root.display()));
+        for p in c.placements.iter().filter(|p| p.location == l.name) {
+            out.push_str(&format!("  {}\n", p.folder.display()));
+        }
+    }
+    out
+}
+
 fn toml_display(c: &Config) -> String {
-    format!(
+    let mut out = format!(
         "client_id = {:?}\nclient_secret = {:?}\nsync_root = {:?}\npoll_interval_secs = {}\nmax_concurrent_transfers = {}\nmax_download_mb_per_sec = {}\nmax_upload_mb_per_sec = {}\nuse_local_trash = {}\nignore = {:?}\n",
         c.client_id,
         c.client_secret,
@@ -245,5 +304,10 @@ fn toml_display(c: &Config) -> String {
         c.max_upload_mb_per_sec,
         c.use_local_trash,
         c.ignore
-    )
+    );
+    if !c.locations.is_empty() {
+        out.push_str("\n[storage locations]\n");
+        out.push_str(&locations_display(c));
+    }
+    out
 }

@@ -6,6 +6,8 @@
 mod updater;
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Context, Result};
@@ -15,8 +17,10 @@ use gdrive_core::config::{self, Config};
 use gdrive_core::db::Db;
 use gdrive_core::engine::{self, Command, EngineHandle};
 use gdrive_core::ipc::{Request, Response};
+use gdrive_core::layout::Layout;
 use gdrive_core::local;
-use gdrive_core::status::{Status, SyncState};
+use gdrive_core::relocate::{self, MoveProgress};
+use gdrive_core::status::{ActivityKind, Relocation, Status, SyncState};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
@@ -33,6 +37,8 @@ struct Daemon {
     check_updates: Arc<tokio::sync::Notify>,
     /// Ends the main loop, as SIGTERM does.
     shutdown: Arc<tokio::sync::Notify>,
+    /// A folder is being moved between drives; the engine stays stopped until done.
+    relocating: bool,
 }
 
 type Shared = Arc<Mutex<Daemon>>;
@@ -105,6 +111,10 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
             Response::Ok
         }
         Request::Lookup { path } => lookup(&d, &path)?,
+        Request::Relocate { folder, location } => {
+            start_relocation(daemon, &mut d, folder, location).await?;
+            Response::Ok
+        }
         Request::Shutdown => {
             tracing::info!("shutdown requested");
             d.shutdown.notify_one();
@@ -142,23 +152,123 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
 
 /// The Drive item synced at `path`, for the file manager's right-click menu.
 fn lookup(d: &Daemon, path: &std::path::Path) -> Result<Response> {
-    let Some(rel) = path.strip_prefix(&d.config.sync_root).ok().filter(|r| !r.as_os_str().is_empty()) else {
+    let layout = Layout::from_config(&d.config);
+    let Some(rel) = layout.rel(path).filter(|r| !r.as_os_str().is_empty()) else {
         bail!("{} is not inside the Drive folder", path.display());
     };
     let db = Db::open(&config::db_file())?;
-    let Some(synced) = db.synced_by_path(rel)? else {
+    let Some(synced) = db.synced_by_path(&rel)? else {
         bail!("{} is not synced yet", rel.display());
     };
     let link = db
         .get_remote(&synced.id)?
         .and_then(|r| r.link)
         .unwrap_or_else(|| gdrive_core::nautilus::fallback_link(&synced.id, synced.is_dir));
-    Ok(Response::Item { id: synced.id, link, is_dir: synced.is_dir })
+    let placement = d.config.placements.iter().find(|p| rel.starts_with(&p.folder));
+    Ok(Response::Item {
+        id: synced.id,
+        link,
+        is_dir: synced.is_dir,
+        placed_in: placement.map(|p| p.location.clone()),
+        placed_root: placement.is_some_and(|p| p.folder == rel),
+        locations: d.config.locations.iter().map(|l| l.name.clone()).collect(),
+        path: rel,
+    })
+}
+
+/// Starts moving a folder between drives in the background: the engine is stopped
+/// for the duration, the files are copied, and the new placement is saved before
+/// the old copy is removed.
+async fn start_relocation(daemon: &Shared, d: &mut Daemon, folder: PathBuf, location: Option<String>) -> Result<()> {
+    if d.relocating {
+        bail!("another folder is being moved; wait for it to finish");
+    }
+    if let Some(name) = &location {
+        if d.config.location(name).is_none() {
+            bail!("there is no storage location called \"{name}\"");
+        }
+    }
+    let folder = if folder.is_absolute() {
+        Layout::from_config(&d.config)
+            .rel(&folder)
+            .ok_or_else(|| anyhow::anyhow!("{} is not inside the Drive folder", folder.display()))?
+    } else {
+        folder
+    };
+    let folder = relocate::normalize(&folder)?;
+
+    d.relocating = true;
+    d.stop_engine().await;
+    let label = location.clone().unwrap_or_else(|| "the main drive".into());
+    tracing::info!("moving {} to {label}", folder.display());
+    let relocation = Relocation { folder: local::rel_str(&folder), to: location.clone(), bytes_done: 0, bytes_total: 0 };
+    {
+        let mut st = d.status.write().unwrap();
+        st.relocation = Some(relocation.clone());
+        st.state = SyncState::Syncing;
+        st.message = Some(format!("Moving {} to {label}…", folder.display()));
+    }
+
+    let progress = Arc::new(MoveProgress::default());
+    let ticker = {
+        let (status, progress) = (d.status.clone(), progress.clone());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Some(r) = status.write().unwrap().relocation.as_mut() {
+                    r.bytes_done = progress.done.load(Ordering::Relaxed);
+                    r.bytes_total = progress.total.load(Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    let config = d.config.clone();
+    let daemon = daemon.clone();
+    tokio::spawn(async move {
+        let job = tokio::task::spawn_blocking(move || -> Result<(Config, PathBuf)> {
+            let db = Db::open(&config::db_file())?;
+            let mut saved = None;
+            let volume = relocate::relocate(&config, &db, &folder, location.as_deref(), &progress, &mut |next| {
+                next.save()?;
+                saved = Some(next.clone());
+                Ok(())
+            })?;
+            Ok((saved.expect("relocate commits before returning Ok"), volume))
+        });
+        let result = job.await.map_err(anyhow::Error::from).and_then(|r| r);
+        ticker.abort();
+        let mut d = daemon.lock().await;
+        d.relocating = false;
+        d.status.write().unwrap().relocation = None;
+        match result {
+            Ok((next, volume)) => {
+                d.config = next;
+                tracing::info!("moved {} to {label}", relocation.folder);
+                d.status.write().unwrap().push_activity(ActivityKind::MovedLocal, relocation.folder.clone(), Some(format!("to {label}")));
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = local::delete_discarded(&volume) {
+                        tracing::warn!("cannot delete the old copy: {e:#}");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::error!("moving {} failed: {e:#}", relocation.folder);
+                d.status.write().unwrap().push_error(relocation.folder.clone(), format!("Could not move it to {label}: {e:#}"));
+            }
+        }
+        if let Err(e) = d.start_engine() {
+            d.set_state(SyncState::Error, Some(format!("{e:#}")));
+        }
+    });
+    Ok(())
 }
 
 /// Wipes the sync folder and the sync state, then restarts the engine, which sees an
 /// empty folder and a never-synced Drive and downloads everything again.
 async fn redownload(d: &mut Daemon) -> Result<()> {
+    if d.relocating {
+        bail!("a folder is being moved; wait for it to finish");
+    }
     let root = d.config.sync_root.clone();
     local::check_discardable(&root)?;
     d.stop_engine().await;
@@ -173,10 +283,23 @@ async fn redownload(d: &mut Daemon) -> Result<()> {
         d.set_state(SyncState::Error, Some(format!("Could not clear the sync folder: {e:#}")));
         return Err(e);
     }
+    let layout = Layout::from_config(&d.config);
+    for folder in layout.placed_folders() {
+        let abs = layout.abs(folder);
+        if abs.exists() {
+            if let Err(e) = local::discard(layout.volume_of(folder), &abs) {
+                d.set_state(SyncState::Error, Some(format!("Could not clear {}: {e:#}", abs.display())));
+                return Err(e);
+            }
+        }
+    }
     tracing::info!("cleared {}; downloading everything again", root.display());
+    let volumes: Vec<PathBuf> = layout.volumes().into_iter().map(PathBuf::from).collect();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = local::delete_discarded(&root) {
-            tracing::warn!("cannot delete discarded files: {e:#}");
+        for volume in volumes {
+            if let Err(e) = local::delete_discarded(&volume) {
+                tracing::warn!("cannot delete discarded files: {e:#}");
+            }
         }
     });
     d.start_engine()
@@ -193,8 +316,23 @@ async fn apply_config(d: &mut Daemon, mut new: Config) -> Result<()> {
             *limit = 0.0;
         }
     }
+    // Placements only change by moving files (Relocate), never through settings.
+    new.placements = d.config.placements.clone();
+    for loc in &mut new.locations {
+        loc.name = loc.name.trim().to_owned();
+    }
+    for p in &d.config.placements {
+        let before = d.config.location(&p.location).map(|l| &l.root);
+        if new.location(&p.location).map(|l| &l.root) != before {
+            bail!("\"{}\" holds {}; move it back to the main drive before changing or removing that drive", p.location, p.folder.display());
+        }
+    }
+    new.validate_storage()?;
     if new == d.config {
         return Ok(());
+    }
+    if d.relocating {
+        bail!("a folder is being moved; wait for it to finish");
     }
     let old = std::mem::replace(&mut d.config, new);
     d.config.save()?;
@@ -320,6 +458,7 @@ async fn main() -> Result<()> {
         login: None,
         check_updates: check_updates.clone(),
         shutdown: shutdown.clone(),
+        relocating: false,
     }));
     tokio::spawn(updater::run(daemon.clone(), http, check_updates));
     {

@@ -38,6 +38,10 @@ pub enum Request {
     Shutdown,
     /// Which Drive item is synced at an absolute local path. Returns `Item`.
     Lookup { path: PathBuf },
+    /// Move a Drive folder to a storage location, or back to the main drive when
+    /// `location` is `None`. `folder` is Drive-relative or an absolute local path.
+    /// Returns at once; progress shows in `Status::relocation`.
+    Relocate { folder: PathBuf, location: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +51,19 @@ pub enum Response {
     Status { status: Box<Status> },
     LoginUrl { url: String },
     Config { config: Config },
-    Item { id: String, link: String, is_dir: bool },
+    Item {
+        id: String,
+        link: String,
+        is_dir: bool,
+        /// Drive-relative path.
+        path: PathBuf,
+        /// Storage location holding it, if it's on another drive.
+        placed_in: Option<String>,
+        /// Whether it is itself a placed folder (so it can be moved back).
+        placed_root: bool,
+        /// Names of all storage locations.
+        locations: Vec<String>,
+    },
     Error { message: String },
 }
 

@@ -26,6 +26,7 @@ use crate::bandwidth::SpeedMeter;
 use crate::config::{Config, META_DIR};
 use crate::db::{Db, RemoteItem, RemoteLookup, SyncedItem, UploadSession};
 use crate::gdoc;
+use crate::layout::Layout;
 use crate::local::{self, depth, rel_str, IgnoreRules, LocalStat};
 use crate::status::{Account, ActivityKind, Direction, Quota, Status, SyncState, Transfer};
 
@@ -131,7 +132,7 @@ enum TransferKind {
 
 /// State shared with transfer tasks.
 struct Shared {
-    root: PathBuf,
+    layout: Layout,
     api: DriveClient,
     db: Mutex<Db>,
     status: Arc<RwLock<Status>>,
@@ -148,9 +149,6 @@ impl Shared {
         self.status.write().unwrap().push_activity(kind, rel_str(rel), detail);
     }
 
-    fn tmp_dir(&self) -> PathBuf {
-        self.root.join(META_DIR).join("tmp")
-    }
 
     fn record(&self, id: &str, rel: &Path, md5: Option<String>, l: LocalStat) -> Result<()> {
         self.db().upsert_synced(&SyncedItem {
@@ -180,22 +178,22 @@ impl Shared {
 
     /// Moves a local item aside to a "conflicted copy" name, returning the new relative path.
     fn move_to_conflict_copy(&self, rel: &Path) -> Result<PathBuf> {
-        let abs = self.root.join(rel);
+        let abs = self.layout.abs(rel);
         let target = local::conflict_path(&abs);
         std::fs::rename(&abs, &target).with_context(|| format!("renaming {}", abs.display()))?;
-        let new_rel = target.strip_prefix(&self.root)?.to_path_buf();
+        let new_rel = self.layout.rel(&target).ok_or_else(|| anyhow!("{} is outside the Drive", target.display()))?;
         self.activity(ActivityKind::Conflict, rel, Some(format!("local version kept as {}", rel_str(&new_rel))));
         Ok(new_rel)
     }
 
     fn write_link_file(&self, remote: &RemoteItem, rel: &Path, email: &str) -> Result<LocalStat> {
-        let tmp = self.tmp_dir().join(format!("{}.link", remote.id));
+        let tmp = self.layout.tmp_dir(rel).join(format!("{}.link", remote.id));
         std::fs::write(&tmp, gdoc::render(&remote.id, remote.link.as_deref(), email))?;
         if let Some(mtime) = remote.mtime {
             let ft = filetime::FileTime::from_unix_time(mtime.timestamp(), mtime.timestamp_subsec_nanos());
             filetime::set_file_mtime(&tmp, ft)?;
         }
-        let abs = self.root.join(rel);
+        let abs = self.layout.abs(rel);
         std::fs::rename(&tmp, &abs)?;
         local::stat(&abs).ok_or_else(|| anyhow!("{} vanished", abs.display()))
     }
@@ -203,7 +201,6 @@ impl Shared {
 
 struct Engine {
     shared: Arc<Shared>,
-    root: PathBuf,
     ignore: IgnoreRules,
     poll_interval: Duration,
     semaphore: Arc<Semaphore>,
@@ -258,20 +255,18 @@ fn is_fatal(err: &anyhow::Error) -> bool {
 impl Engine {
     fn new(config: &Config, api: DriveClient, db: Db, status: Arc<RwLock<Status>>, cancel: CancellationToken) -> Self {
         let (done_tx, done_rx) = mpsc::unbounded_channel();
-        let root = config.sync_root.clone();
         api.bandwidth().set_limits(config.max_download_mb_per_sec, config.max_upload_mb_per_sec);
         if let Err(e) = db.prune_upload_sessions(upload_session_cutoff()) {
             tracing::warn!("pruning upload sessions: {e:#}");
         }
         Self {
             shared: Arc::new(Shared {
-                root: root.clone(),
+                layout: Layout::from_config(config),
                 api,
                 db: Mutex::new(db),
                 status,
                 use_trash: config.use_local_trash,
             }),
-            root,
             ignore: IgnoreRules::new(&config.ignore),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_transfers.clamp(1, 16))),
@@ -299,6 +294,10 @@ impl Engine {
 
     fn db(&self) -> MutexGuard<'_, Db> {
         self.shared.db()
+    }
+
+    fn layout(&self) -> &Layout {
+        &self.shared.layout
     }
 
     fn set_state(&self, state: SyncState, message: Option<String>) {
@@ -400,10 +399,13 @@ impl Engine {
         }
 
         self.check_root(true)?;
+        self.ensure_placeholders();
         // Partial downloads from a previous run that was interrupted.
-        if let Ok(entries) = std::fs::read_dir(self.shared.tmp_dir()) {
-            for entry in entries.flatten() {
-                let _ = std::fs::remove_file(entry.path());
+        for volume in self.layout().volumes() {
+            if let Ok(entries) = std::fs::read_dir(volume.join(META_DIR).join("tmp")) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
             }
         }
 
@@ -413,8 +415,13 @@ impl Engine {
             let mut w = notify::recommended_watcher(move |res| {
                 let _ = tx.send(res);
             })?;
-            w.watch(&self.root, notify::RecursiveMode::Recursive)
-                .with_context(|| format!("watching {}", self.root.display()))?;
+            // Other disks are watched from their root, so placed folders are covered
+            // even before they exist. Events may come in under either path; the
+            // layout maps both back, and ignores the rest of those disks.
+            for volume in self.layout().volumes() {
+                w.watch(volume, notify::RecursiveMode::Recursive)
+                    .with_context(|| format!("watching {}", volume.display()))?;
+            }
             *watcher = Some(w);
         }
 
@@ -436,23 +443,57 @@ impl Engine {
         Ok(())
     }
 
-    /// Ensures the sync root exists and is the one we synced before.
+    /// Ensures the sync root, and every other disk holding placed folders, exists and
+    /// is the one we synced before. A missing disk must never read as "all deleted".
     fn check_root(&self, create: bool) -> Result<()> {
-        let marker = self.root.join(META_DIR);
-        if !marker.is_dir() {
-            if self.db().synced_count()? > 0 {
-                bail!(
-                    "The sync folder {} is missing or not mounted. Restore it, or sign out and back in to start over.",
-                    self.root.display()
-                );
+        let layout = self.layout();
+        for volume in layout.volumes() {
+            let marker = volume.join(META_DIR);
+            if !marker.is_dir() {
+                let is_main = volume == layout.main();
+                let synced_here = if is_main {
+                    self.db().synced_count()? > 0
+                } else {
+                    let db = self.db();
+                    let mut any = false;
+                    for folder in layout.placed_folders().filter(|f| layout.on_volume(f, volume)) {
+                        any |= db.synced_by_path(folder)?.is_some();
+                    }
+                    any
+                };
+                if synced_here {
+                    if is_main {
+                        bail!(
+                            "The sync folder {} is missing or not mounted. Restore it, or sign out and back in to start over.",
+                            volume.display()
+                        );
+                    }
+                    bail!("The drive at {} is missing or not mounted. Connect it to continue syncing.", volume.display());
+                }
+                if !create {
+                    bail!("sync folder {} is missing", volume.display());
+                }
+                std::fs::create_dir_all(&marker)?;
             }
-            if !create {
-                bail!("sync folder {} is missing", self.root.display());
-            }
-            std::fs::create_dir_all(&marker)?;
+            std::fs::create_dir_all(marker.join("tmp"))?;
         }
-        std::fs::create_dir_all(self.shared.tmp_dir())?;
         Ok(())
+    }
+
+    /// Leaves a symlink at each placed folder's spot in the sync root, so the whole
+    /// Drive stays browsable from there. Sync itself never follows these.
+    fn ensure_placeholders(&self) {
+        let layout = self.layout();
+        for folder in layout.placed_folders() {
+            let target = layout.abs(folder);
+            let link = layout.main().join(folder);
+            if std::fs::read_link(&link).is_ok_and(|t| t == target) {
+                continue;
+            }
+            if let Err(e) = local::make_placeholder(&link, &target, layout.main()) {
+                tracing::warn!("cannot link {} to {}: {e:#}", link.display(), target.display());
+            }
+        }
     }
 
     fn apply_about(&self, about: crate::api::About) {
@@ -534,11 +575,11 @@ impl Engine {
         }
         let mut relevant = false;
         for path in ev.paths {
-            let Ok(rel) = path.strip_prefix(&self.root) else { continue };
-            if rel.as_os_str().is_empty() || self.ignore.is_ignored(rel) {
+            let Some(rel) = self.layout().rel(&path) else { continue };
+            if rel.as_os_str().is_empty() || self.ignore.is_ignored(&rel) {
                 continue;
             }
-            self.dirty_paths.insert(rel.to_path_buf());
+            self.dirty_paths.insert(rel);
             relevant = true;
         }
         if relevant {
@@ -878,19 +919,30 @@ impl Engine {
         let by_path: HashMap<&Path, &SyncedItem> = synced.iter().map(|s| (s.rel_path.as_path(), s)).collect();
         let mut unchanged_locally = HashSet::new();
         let mut new_paths = 0;
-        let (ignore, root) = (&self.ignore, &self.root);
-        let walker = walkdir::WalkDir::new(root).min_depth(1).follow_links(false).into_iter().filter_entry(|e| {
-            e.path().strip_prefix(root).map(|rel| !ignore.is_ignored(rel)).unwrap_or(false)
+        let layout = self.shared.layout.clone();
+        let ignore = &self.ignore;
+        // The sync root (placeholder symlinks are skipped like any symlink), then each
+        // placed folder where it really lives.
+        let mut walks = vec![(layout.main().to_path_buf(), 1)];
+        walks.extend(layout.placed_folders().map(|f| (layout.abs(f), 0)));
+        let entries = walks.into_iter().flat_map(|(start, min_depth)| {
+            let layout = &layout;
+            walkdir::WalkDir::new(start)
+                .min_depth(min_depth)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(move |e| layout.rel(e.path()).is_some_and(|rel| !ignore.is_ignored(&rel)))
+                .flatten()
         });
-        for entry in walker.flatten() {
-            let Ok(rel) = entry.path().strip_prefix(root) else { continue };
+        for entry in entries {
+            let Some(rel) = layout.rel(entry.path()) else { continue };
             let Some(l) = entry.metadata().ok().filter(|m| m.is_file() || m.is_dir()).map(|m| LocalStat::from_meta(&m))
             else {
                 continue; // symlinks and special files are never synced
             };
-            match by_path.get(rel) {
+            match by_path.get(rel.as_path()) {
                 None => {
-                    self.dirty_paths.insert(rel.to_path_buf());
+                    self.dirty_paths.insert(rel);
                     new_paths += 1;
                 }
                 Some(s) => {
@@ -933,6 +985,11 @@ impl Engine {
         Ok(())
     }
 
+    /// Re-reads the inodes of a synced subtree after it was copied to another disk.
+    fn refresh_inodes(&self, rel: &Path) -> Result<()> {
+        crate::relocate::refresh_inodes(&self.db(), self.layout(), rel)
+    }
+
     fn inflight_under(&self, dir: &Path) -> bool {
         self.inflight.keys().any(|p| p.starts_with(dir))
     }
@@ -969,7 +1026,7 @@ impl Engine {
                 }
                 if let Some(s) = db.synced_by_path(&p)? {
                     ids.insert(s.id);
-                } else if std::fs::symlink_metadata(self.root.join(&p)).is_ok() {
+                } else if std::fs::symlink_metadata(self.layout().abs(&p)).is_ok() {
                     unknown.push(p);
                 } else {
                     gone.push(p);
@@ -1086,7 +1143,7 @@ impl Engine {
                 return Ok(Outcome::Defer); // parent folder not created yet
             }
         }
-        let abs = self.root.join(&rel);
+        let abs = self.layout().abs(&rel);
         match local::stat(&abs) {
             None if std::fs::symlink_metadata(&abs).is_ok() => {
                 // A symlink or special file occupies the name; leave it alone.
@@ -1132,7 +1189,7 @@ impl Engine {
     }
 
     async fn create_local_from_remote(&mut self, r: RemoteItem, rel: PathBuf) -> Result<Outcome> {
-        let abs = self.root.join(&rel);
+        let abs = self.layout().abs(&rel);
         if r.is_dir() {
             std::fs::create_dir(&abs).with_context(|| format!("creating {}", abs.display()))?;
             let l = local::stat(&abs).ok_or_else(|| anyhow!("{} vanished", abs.display()))?;
@@ -1170,7 +1227,7 @@ impl Engine {
 
     /// A synced item that is no longer in My Drive.
     fn remote_gone(&mut self, s: SyncedItem) -> Result<Outcome> {
-        let abs = self.root.join(&s.rel_path);
+        let abs = self.layout().abs(&s.rel_path);
         if self.inflight_under(&s.rel_path) {
             return Ok(Outcome::Defer);
         }
@@ -1194,6 +1251,9 @@ impl Engine {
         db_forget(self)?;
         if clean {
             self.shared.remove_local(&abs)?;
+            if self.layout().is_placed_folder(&s.rel_path) {
+                let _ = local::remove_placeholder(&self.layout().main().join(&s.rel_path));
+            }
             self.shared.activity(ActivityKind::DeletedLocal, &s.rel_path, None);
         } else {
             // Deleted on Drive but edited here: keep the local version and upload it again.
@@ -1210,15 +1270,15 @@ impl Engine {
     /// True if nothing under a local folder differs from the synced tree.
     fn subtree_clean(&self, dir: &Path) -> Result<bool> {
         let db = self.db();
-        let root = &self.root;
-        for entry in walkdir::WalkDir::new(root.join(dir)).min_depth(1).follow_links(false) {
+        let layout = self.layout();
+        for entry in walkdir::WalkDir::new(layout.abs(dir)).min_depth(1).follow_links(false) {
             let entry = entry?;
-            let rel = entry.path().strip_prefix(root)?;
-            if self.ignore.is_ignored(rel) {
+            let Some(rel) = layout.rel(entry.path()) else { continue };
+            if self.ignore.is_ignored(&rel) {
                 continue;
             }
             let Some(l) = local::stat(entry.path()) else { continue };
-            match db.synced_by_path(rel)? {
+            match db.synced_by_path(&rel)? {
                 Some(s) if s.is_dir && l.is_dir => {}
                 Some(s) if !s.is_dir && !l.is_dir && s.size == l.size && s.mtime_ns == l.mtime_ns => {}
                 _ => return Ok(false),
@@ -1228,7 +1288,7 @@ impl Engine {
     }
 
     async fn reconcile_both(&mut self, mut s: SyncedItem, r: RemoteItem, rpath: PathBuf) -> Result<Outcome> {
-        let abs = self.root.join(&s.rel_path);
+        let abs = self.layout().abs(&s.rel_path);
         let Some(l) = local::stat(&abs) else {
             return self.local_gone(s, r).await;
         };
@@ -1248,7 +1308,7 @@ impl Engine {
             if self.inflight_under(&s.rel_path) {
                 return Ok(Outcome::Defer);
             }
-            let target = self.root.join(&rpath);
+            let target = self.layout().abs(&rpath);
             if !target.parent().is_some_and(Path::is_dir) {
                 return Ok(Outcome::Defer);
             }
@@ -1266,9 +1326,17 @@ impl Engine {
                     }
                 }
             }
-            std::fs::rename(&abs, &target)
+            let copied = local::move_path(&abs, &target)
                 .with_context(|| format!("moving {} to {}", abs.display(), target.display()))?;
             self.db().move_synced_subtree(&s.rel_path, &rpath)?;
+            if copied {
+                // Moved to another disk: new inodes, which rename detection relies on.
+                self.refresh_inodes(&rpath)?;
+            }
+            if self.layout().is_placed_folder(&s.rel_path) {
+                tracing::warn!("{} was moved on Drive; it now lives at {}", rel_str(&s.rel_path), target.display());
+                let _ = local::remove_placeholder(&self.layout().main().join(&s.rel_path));
+            }
             self.shared.activity(ActivityKind::MovedLocal, &rpath, Some(format!("from {}", rel_str(&s.rel_path))));
             s.rel_path = rpath;
         }
@@ -1276,7 +1344,7 @@ impl Engine {
         if s.is_dir {
             return Ok(Outcome::Done);
         }
-        let abs = self.root.join(&s.rel_path);
+        let abs = self.layout().abs(&s.rel_path);
         let local_changed = l.size != s.size || l.mtime_ns != s.mtime_ns;
 
         // 2. Native Google files: the link file is read-only; just track its stat.
@@ -1328,7 +1396,7 @@ impl Engine {
     async fn local_gone(&mut self, s: SyncedItem, r: RemoteItem) -> Result<Outcome> {
         // If the parent folder went too, let the parent's deletion handle the whole subtree.
         if let Some(parent) = s.rel_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if !self.root.join(parent).exists() {
+            if !self.layout().abs(parent).exists() {
                 let parent_synced = self.db().synced_by_path(parent)?;
                 if let Some(ps) = parent_synced {
                     self.dirty_ids.insert(ps.id);
@@ -1376,13 +1444,13 @@ impl Engine {
     /// Detects a local rename/move: an unknown path whose inode belongs to a synced
     /// item that's no longer at its old path. Returns the item's id if handled.
     async fn try_local_rename(&mut self, rel: &Path) -> Result<Option<String>> {
-        let Some(l) = local::stat(&self.root.join(rel)) else { return Ok(None) };
+        let Some(l) = local::stat(&self.layout().abs(rel)) else { return Ok(None) };
         let (s, r, new_parent) = {
             let db = self.db();
             let candidate = db.synced_by_inode(l.inode)?.into_iter().find(|s| {
                 s.is_dir == l.is_dir
                     && s.rel_path != rel
-                    && local::stat(&self.root.join(&s.rel_path)).is_none_or(|cur| cur.inode != l.inode)
+                    && local::stat(&self.layout().abs(&s.rel_path)).is_none_or(|cur| cur.inode != l.inode)
                     && (s.is_dir || (s.size == l.size && s.mtime_ns == l.mtime_ns))
             });
             let Some(s) = candidate else { return Ok(None) };
@@ -1432,7 +1500,7 @@ impl Engine {
         if self.ignore.is_ignored(rel) || self.inflight.contains_key(rel) {
             return Ok(Outcome::Done);
         }
-        let abs = self.root.join(rel);
+        let abs = self.layout().abs(rel);
         let Some(l) = local::stat(&abs) else { return Ok(Outcome::Done) };
         enum Next {
             Synced(String),
@@ -1607,7 +1675,7 @@ async fn run_download(
     expected: Option<LocalStat>,
     progress: &Progress,
 ) -> Result<()> {
-    let tmp = shared.tmp_dir().join(format!("{}.part", remote.id));
+    let tmp = shared.layout.tmp_dir(rel).join(format!("{}.part", remote.id));
     let result = async {
         let md5 = shared.api.download(&remote.id, &tmp, progress).await?;
         if let Some(want) = &remote.md5 {
@@ -1619,7 +1687,7 @@ async fn run_download(
             let ft = filetime::FileTime::from_unix_time(mtime.timestamp(), mtime.timestamp_subsec_nanos());
             filetime::set_file_mtime(&tmp, ft)?;
         }
-        let abs = shared.root.join(rel);
+        let abs = shared.layout.abs(rel);
         // The local file may have changed while we downloaded: never clobber it.
         let current = local::stat(&abs);
         let unchanged = match (expected, current) {
@@ -1654,7 +1722,7 @@ async fn run_upload(
     retrying: bool,
     progress: &Progress,
 ) -> Result<()> {
-    let abs = shared.root.join(rel);
+    let abs = shared.layout.abs(rel);
     let result = upload_file(shared, existing_id, parent_id, name, rel, &abs, md5, retrying, progress).await;
     let result = match result {
         Err(_) if local::stat(&abs).is_none() => Err(Vanished(rel_str(rel)).into()),

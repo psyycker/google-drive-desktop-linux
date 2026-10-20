@@ -138,6 +138,20 @@ pub struct Status {
     /// Set when a newer release exists.
     #[serde(default)]
     pub update: Option<UpdateInfo>,
+    /// Set while a folder is being moved to or from another drive.
+    #[serde(default)]
+    pub relocation: Option<Relocation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Relocation {
+    /// Drive-relative folder being moved.
+    pub folder: String,
+    /// Storage location name, or `None` when moving back to the main drive.
+    pub to: Option<String>,
+    pub bytes_done: u64,
+    /// 0 until known (and for a rename on the same disk).
+    pub bytes_total: u64,
 }
 
 /// "4.2 MB", "310 KB", "12 B" (binary units, like file managers).
@@ -188,6 +202,7 @@ impl Status {
             last_synced: None,
             version: crate::update::CURRENT_VERSION.to_owned(),
             update: None,
+            relocation: None,
         }
     }
 

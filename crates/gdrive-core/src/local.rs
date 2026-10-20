@@ -220,6 +220,112 @@ pub fn delete_discarded(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Moves a file or folder, also to another disk. Returns `true` when it had to be
+/// copied (another filesystem), which gives everything new inodes.
+pub fn move_path(src: &Path, dst: &Path) -> Result<bool> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(false),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            let staging = staging_path(dst);
+            remove_any(&staging)?;
+            copy_tree(src, &staging, &mut |_| {})?;
+            std::fs::rename(&staging, dst)?;
+            remove_any(src)?;
+            Ok(true)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Where a copy to `dst` is assembled before it is renamed into place, so a crash
+/// mid-copy never leaves a half-copied tree under the real name.
+pub fn staging_path(dst: &Path) -> PathBuf {
+    let mut name = dst.file_name().unwrap_or_default().to_os_string();
+    name.push(".gdrive-moving");
+    dst.with_file_name(name)
+}
+
+/// Copies a file or a whole tree, keeping modification times and permissions.
+/// Symlinks are copied as symlinks. `copied` gets the size of each file once done.
+pub fn copy_tree(src: &Path, dst: &Path, copied: &mut dyn FnMut(u64)) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)?;
+        return Ok(());
+    }
+    if meta.is_dir() {
+        std::fs::create_dir(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()), copied)?;
+        }
+    } else {
+        std::fs::copy(src, dst)?;
+        copied(meta.len());
+    }
+    std::fs::set_permissions(dst, meta.permissions())?;
+    filetime::set_file_mtime(dst, filetime::FileTime::from_last_modification_time(&meta))?;
+    Ok(())
+}
+
+/// Total size of the files in a tree (symlinks not followed).
+pub fn tree_size(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.metadata().ok().filter(|m| m.is_file()).map(|m| m.len()))
+        .sum()
+}
+
+/// Deletes a file, symlink or folder if it exists.
+pub fn remove_any(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+/// Moves `path` into a fresh `discarded-*` folder in `root`'s [`META_DIR`] (on the
+/// same disk, so it is a rename), where [`delete_discarded`] removes it later.
+pub fn discard(root: &Path, path: &Path) -> Result<()> {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let target = root.join(META_DIR).join(format!("{DISCARDED_PREFIX}{}", stamp.as_nanos()));
+    std::fs::create_dir_all(&target)?;
+    std::fs::rename(path, target.join(path.file_name().unwrap_or_default()))?;
+    Ok(())
+}
+
+/// Puts a symlink to `target` at `link`. Anything else already there is set aside
+/// into `main`'s discarded folder (never deleted outright), since it may be the
+/// leftover of a move that was interrupted.
+pub fn make_placeholder(link: &Path, target: &Path, main: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(link) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::remove_file(link)?,
+        Ok(_) => {
+            tracing::warn!("{} is in the way of the link to {}; setting it aside", link.display(), target.display());
+            discard(main, link)?;
+        }
+        Err(_) => {}
+    }
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+/// Removes a placeholder symlink; leaves anything that isn't a symlink alone.
+pub fn remove_placeholder(link: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) {
+        std::fs::remove_file(link)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +384,43 @@ mod tests {
         assert!(rules.is_ignored(Path::new("docs/.report.txt.swp")));
         assert!(rules.is_ignored(Path::new("a/b.tmp")));
         assert!(!rules.is_ignored(Path::new("docs/report.odt")));
+    }
+
+    #[test]
+    fn copy_tree_keeps_content_and_mtimes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/a.txt"), "hello").unwrap();
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 123);
+        filetime::set_file_mtime(src.join("sub/a.txt"), old).unwrap();
+        std::os::unix::fs::symlink("sub/a.txt", src.join("link")).unwrap();
+        let dst = tmp.path().join("dst");
+        let mut total = 0;
+        copy_tree(&src, &dst, &mut |n| total += n).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(std::fs::read_to_string(dst.join("sub/a.txt")).unwrap(), "hello");
+        let meta = std::fs::metadata(dst.join("sub/a.txt")).unwrap();
+        assert_eq!(filetime::FileTime::from_last_modification_time(&meta), old);
+        assert_eq!(std::fs::read_link(dst.join("link")).unwrap(), Path::new("sub/a.txt"));
+        assert_eq!(tree_size(&dst), 5);
+    }
+
+    #[test]
+    fn placeholder_sets_aside_what_is_in_the_way() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let target = tmp.path().join("ssd/Gaming");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(main.join("Gaming")).unwrap();
+        std::fs::write(main.join("Gaming/left.txt"), "x").unwrap();
+        make_placeholder(&main.join("Gaming"), &target, &main).unwrap();
+        assert_eq!(std::fs::read_link(main.join("Gaming")).unwrap(), target);
+        let discarded: Vec<_> = std::fs::read_dir(main.join(META_DIR)).unwrap().flatten().collect();
+        assert_eq!(discarded.len(), 1);
+        assert!(discarded[0].path().join("Gaming/left.txt").exists());
+        remove_placeholder(&main.join("Gaming")).unwrap();
+        assert!(std::fs::symlink_metadata(main.join("Gaming")).is_err());
+        assert!(target.is_dir());
     }
 }
