@@ -124,7 +124,9 @@ struct Done {
 
 enum TransferKind {
     Download { remote: RemoteItem, expected: Option<LocalStat> },
-    Upload { existing_id: Option<String>, parent_id: String, name: String },
+    /// `retrying`: an earlier attempt to upload this new file failed, possibly after
+    /// Drive had already created it.
+    Upload { existing_id: Option<String>, parent_id: String, name: String, retrying: bool },
 }
 
 /// State shared with transfer tasks.
@@ -1516,7 +1518,9 @@ impl Engine {
         l: LocalStat,
     ) {
         let id = existing_id.clone();
-        self.spawn_transfer(rel, id, Direction::Upload, l.size, TransferKind::Upload { existing_id, parent_id, name }, md5);
+        let retrying = existing_id.is_none() && self.retry.contains_key(&Work::Path(rel.clone()));
+        let kind = TransferKind::Upload { existing_id, parent_id, name, retrying };
+        self.spawn_transfer(rel, id, Direction::Upload, l.size, kind, md5);
     }
 
     fn spawn_transfer(
@@ -1551,8 +1555,8 @@ impl Engine {
                         TransferKind::Download { remote, expected } => {
                             run_download(&shared, &remote, &rel, expected, &progress).await
                         }
-                        TransferKind::Upload { existing_id, parent_id, name } => {
-                            run_upload(&shared, existing_id.as_deref(), &parent_id, &name, &rel, md5, &progress).await
+                        TransferKind::Upload { existing_id, parent_id, name, retrying } => {
+                            run_upload(&shared, existing_id.as_deref(), &parent_id, &name, &rel, md5, retrying, &progress).await
                         }
                     }
                 } => r,
@@ -1639,6 +1643,7 @@ async fn run_download(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_upload(
     shared: &Shared,
     existing_id: Option<&str>,
@@ -1646,10 +1651,11 @@ async fn run_upload(
     name: &str,
     rel: &Path,
     md5: Option<String>,
+    retrying: bool,
     progress: &Progress,
 ) -> Result<()> {
     let abs = shared.root.join(rel);
-    let result = upload_file(shared, existing_id, parent_id, name, rel, &abs, md5, progress).await;
+    let result = upload_file(shared, existing_id, parent_id, name, rel, &abs, md5, retrying, progress).await;
     let result = match result {
         Err(_) if local::stat(&abs).is_none() => Err(Vanished(rel_str(rel)).into()),
         r => r,
@@ -1672,6 +1678,7 @@ async fn upload_file(
     rel: &Path,
     abs: &Path,
     md5: Option<String>,
+    retrying: bool,
     progress: &Progress,
 ) -> Result<()> {
     // Stat before reading: if the file changes mid-upload, the next pass sees a
@@ -1681,12 +1688,45 @@ async fn upload_file(
         Some(m) => m,
         None => hash(abs).await?,
     };
-    let file = send_upload(shared, existing_id, parent_id, name, rel, abs, &before, progress).await?;
+    let file = match existing_id {
+        None => match already_uploaded(shared, parent_id, name, rel, &md5, &before, retrying).await? {
+            Some(file) => file,
+            None => send_upload(shared, existing_id, parent_id, name, rel, abs, &before, progress).await?,
+        },
+        Some(_) => send_upload(shared, existing_id, parent_id, name, rel, abs, &before, progress).await?,
+    };
     shared.db().upsert_remote(&RemoteItem::from(&file))?;
     let recorded_md5 = file.md5_checksum.clone().or(Some(md5));
     shared.record(&file.id, rel, recorded_md5, before)?;
     shared.activity(ActivityKind::Uploaded, rel, None);
     Ok(())
+}
+
+/// A file on Drive that an earlier, failed attempt to upload this new file already
+/// created: same name, folder and content, and not synced to anything else. An upload
+/// whose reply was lost, or that failed only after Drive had stored it, leaves such a
+/// file behind, and uploading again would put a second copy next to it. Drive is only
+/// asked when an earlier attempt may have got that far.
+async fn already_uploaded(
+    shared: &Shared,
+    parent_id: &str,
+    name: &str,
+    rel: &Path,
+    md5: &str,
+    before: &LocalStat,
+    retrying: bool,
+) -> Result<Option<crate::api::DriveFile>> {
+    let attempted = retrying || shared.db().get_upload_session(rel)?.is_some();
+    if !attempted {
+        return Ok(None);
+    }
+    for file in shared.api.find_named(parent_id, name).await? {
+        if file.md5_checksum.as_deref() == Some(md5) && file.size() == before.size && shared.db().get_synced(&file.id)?.is_none() {
+            tracing::info!("{}: already on Drive from an earlier attempt", rel_str(rel));
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
 }
 
 /// Sends the file's content, continuing a saved upload session for this exact file and

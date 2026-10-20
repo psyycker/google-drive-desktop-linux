@@ -386,6 +386,18 @@ impl DriveClient {
         Ok(out)
     }
 
+    /// Non-trashed files called `name` directly in `folder_id`.
+    pub async fn find_named(&self, folder_id: &str, name: &str) -> Result<Vec<DriveFile>> {
+        let name = name.replace('\\', "\\\\").replace('\'', "\\'");
+        let mut out = Vec::new();
+        self.list(&format!("'{folder_id}' in parents and name = '{name}' and trashed = false"), |files| {
+            out.extend(files);
+            Ok(())
+        })
+        .await?;
+        Ok(out)
+    }
+
     pub async fn changes(&self, page_token: &str) -> Result<ChangePage> {
         let fields = format!("nextPageToken,newStartPageToken,changes(fileId,removed,file({FILE_FIELDS}))");
         self.get_json(
@@ -655,7 +667,10 @@ enum SessionState {
 async fn session_response(resp: Response) -> Result<SessionState> {
     let status = resp.status();
     if status.is_success() {
-        return Ok(SessionState::Done(resp.json().await?));
+        // Drive has the whole file by now. If its reply can't be read, asking the session
+        // again returns the file; starting over would upload a second copy.
+        let file = resp.json().await.map_err(|e| ApiError::Offline(format!("reading the upload reply: {e}")))?;
+        return Ok(SessionState::Done(file));
     }
     if status == StatusCode::PERMANENT_REDIRECT {
         // "Range: bytes=0-N" when N+1 bytes are stored; no header when none are.

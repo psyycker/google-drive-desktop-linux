@@ -105,6 +105,11 @@ pub struct DriveState {
     /// Upload PUTs to cut off after `cut_uploads_after` bytes, as if the connection dropped.
     pub cut_uploads: u32,
     pub cut_uploads_after: usize,
+    /// Uploads to store as usual but then answer with a garbled body, as if the
+    /// connection dropped while the reply came back.
+    pub garble_upload_replies: u32,
+    /// Uploads to store as usual but then answer with an error that isn't worth retrying.
+    pub fail_after_upload: u32,
     /// Files flagged as malware/spam that the user doesn't own: never downloadable.
     pub undownloadable: HashSet<String>,
     /// Files flagged as malware/spam that the user owns: downloadable with acknowledgeAbuse.
@@ -197,11 +202,24 @@ async fn list_files(State(st): State<St>, Query(q): Query<HashMap<String, String
     let s = st.lock().unwrap();
     let query = q.get("q").cloned().unwrap_or_default();
     let parent = query.strip_prefix('\'').and_then(|r| r.split_once('\'')).map(|(p, _)| p.to_owned());
+    let name = query.split_once("name = '").map(|(_, r)| {
+        let mut name = String::new();
+        let mut chars = r.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => name.extend(chars.next()),
+                '\'' => break,
+                c => name.push(c),
+            }
+        }
+        name
+    });
     let all: Vec<&FFile> = s
         .files
         .values()
         .filter(|f| !f.trashed)
         .filter(|f| parent.as_ref().is_none_or(|p| f.parents.contains(p)))
+        .filter(|f| name.as_ref().is_none_or(|n| &f.name == n))
         .collect();
     let offset: usize = q.get("pageToken").and_then(|t| t.parse().ok()).unwrap_or(0);
     let page: Vec<Value> = all.iter().skip(offset).take(PAGE).map(|f| f.json()).collect();
@@ -407,6 +425,14 @@ async fn put_session(
     s.record(&id);
     s.counters.uploads += 1;
     s.counters.writes += 1;
+    if s.garble_upload_replies > 0 {
+        s.garble_upload_replies -= 1;
+        return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], "{\"id\": \"").into_response();
+    }
+    if s.fail_after_upload > 0 {
+        s.fail_after_upload -= 1;
+        return api_error(StatusCode::BAD_REQUEST, "injected failure after storing the upload");
+    }
     Json(s.files[&id].json()).into_response()
 }
 
@@ -469,6 +495,16 @@ impl FakeDrive {
         let mut s = self.state.lock().unwrap();
         s.cut_uploads = n;
         s.cut_uploads_after = after;
+    }
+
+    /// Stores the next `n` uploads but garbles Drive's reply to each.
+    pub fn garble_upload_replies(&self, n: u32) {
+        self.state.lock().unwrap().garble_upload_replies = n;
+    }
+
+    /// Stores the next `n` uploads but answers each with a non-retryable error.
+    pub fn fail_after_upload(&self, n: u32) {
+        self.state.lock().unwrap().fail_after_upload = n;
     }
 
     /// Forgets every upload session, as Drive does once they expire.

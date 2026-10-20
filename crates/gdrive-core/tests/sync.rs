@@ -637,3 +637,50 @@ async fn expired_upload_session_starts_over() {
     assert!(h.status().errors.is_empty(), "{:?}", h.status().errors);
     h.stop().await;
 }
+
+/// Regression: Drive stored an upload but its reply was lost. The unreadable reply was
+/// taken as a failure that retrying couldn't fix, so the session was dropped and the
+/// next attempt uploaded the file a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_upload_reply_does_not_upload_twice() {
+    support::init_logs();
+    let drive = support::FakeDrive::start().await;
+    let api = drive.client();
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("knock.mid");
+    std::fs::write(&local, b"MThd tune").unwrap();
+    drive.garble_upload_replies(1);
+
+    let progress = Default::default();
+    let file = api.upload_new("knock.mid", ROOT, &local, chrono::Utc::now(), &progress).await.unwrap();
+    assert_eq!(drive.children(ROOT), vec!["knock.mid"]);
+    assert_eq!(drive.find("knock.mid").map(|f| f.id), Some(file.id));
+    let c = drive.counters();
+    assert_eq!((c.sessions, c.uploads), (1, 1));
+}
+
+/// Regression: an upload that failed after Drive had already stored the file was retried
+/// before the next Drive poll showed that file, so a second copy was created next to it
+/// and then downloaded as "knock (2).mid".
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_failing_after_drive_stored_it_is_not_duplicated() {
+    support::init_logs();
+    let mut h = Harness::new().await;
+    // Polls slower than the retry backoff, as when Drive is rate-limiting the polls too.
+    let config = gdrive_core::config::Config { poll_interval_secs: 120, ..h.config() };
+    h.start_with(config);
+    h.settle().await;
+    h.drive.fail_after_upload(1);
+    h.write("knock.mid", b"MThd tune");
+    h.wait("error reported", T, |h| h.status().errors.iter().any(|e| e.path == "knock.mid")).await;
+    h.wait("retried", 30, |h| h.status().errors.is_empty()).await;
+    h.settle().await;
+
+    assert_eq!(h.drive.children(ROOT), vec!["knock.mid"], "uploaded twice");
+    assert_eq!(h.drive.counters().uploads, 1);
+    assert_eq!(h.local_tree(), vec!["knock.mid"]);
+    h.send(Command::SyncNow);
+    h.settle().await;
+    assert_eq!(h.drive.counters().uploads, 1, "uploaded again once synced");
+    h.stop().await;
+}
