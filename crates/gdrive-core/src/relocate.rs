@@ -129,7 +129,7 @@ pub fn relocate(
 
     // Point of no return passed: tidy up the old copy and the symlink.
     let link = new.main().join(&folder);
-    if !same_disk && std::fs::symlink_metadata(&src).is_ok() && src != link {
+    if !same_disk && std::fs::symlink_metadata(&src).is_ok() {
         local::discard(&src_volume, &src)?;
     }
     if to.is_some() {
