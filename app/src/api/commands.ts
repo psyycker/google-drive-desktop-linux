@@ -14,6 +14,9 @@ export const resume = () => invoke<void>('resume');
 export const syncNow = () => invoke<void>('sync_now');
 export const fullResync = () => invoke<void>('full_resync');
 export const redownload = () => invoke<void>('redownload');
+/** Moves a Drive folder to a storage location, or back to the main drive with `null`. */
+export const relocateFolder = (folder: string, location: string | null) =>
+  invoke<void>('relocate_folder', { folder, location });
 
 /** Starts the OAuth flow; resolves to the URL in case the browser did not open. */
 export const startLogin = () => invoke<string>('start_login');
@@ -35,13 +38,11 @@ export const getAutostart = () => invoke<boolean>('get_autostart');
 export const setAutostart = (enabled: boolean) => invoke<void>('set_autostart', { enabled });
 
 /** Asks for a folder; resolves to `null` when the dialog is cancelled. */
-export async function pickFolder(defaultPath?: string): Promise<string | null> {
-  const picked = await open({
-    directory: true,
-    multiple: false,
-    defaultPath,
-    title: 'Choose your Google Drive folder',
-  });
+export async function pickFolder(
+  defaultPath?: string,
+  title = 'Choose your Google Drive folder',
+): Promise<string | null> {
+  const picked = await open({ directory: true, multiple: false, defaultPath, title });
   return typeof picked === 'string' && picked ? picked : null;
 }
 

@@ -13,7 +13,8 @@ export function StatusBanner() {
   const command = useDaemonCommand();
   const b = bannerContent(status, loaded);
 
-  const active = !!status && isActiveState(status.state);
+  // Syncing is stopped while a folder moves between drives; it resumes by itself.
+  const active = !!status && isActiveState(status.state) && !status.relocation;
   const paused = status?.state === 'paused';
 
   return (

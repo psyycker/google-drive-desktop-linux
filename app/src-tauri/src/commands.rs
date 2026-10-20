@@ -57,6 +57,11 @@ pub async fn redownload(state: State<'_, AppState>) -> CmdResult<()> {
 }
 
 #[tauri::command]
+pub async fn relocate_folder(state: State<'_, AppState>, folder: PathBuf, location: Option<String>) -> CmdResult<()> {
+    simple(&state, Request::Relocate { folder, location }).await
+}
+
+#[tauri::command]
 pub async fn sign_out(state: State<'_, AppState>) -> CmdResult<()> {
     simple(&state, Request::SignOut).await
 }

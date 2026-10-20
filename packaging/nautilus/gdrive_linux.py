@@ -1,9 +1,10 @@
 """GNOME Files (Nautilus) menu items for gdrive-linux.
 
 Adds "Open in Google Drive", "Copy Drive link", "Share…" and "Sync now" to the
-right-click menu of items inside the Drive folder. It asks the gdrived daemon over
-its Unix socket which Drive file a path is, so nothing shows outside the folder or
-while the daemon isn't running.
+right-click menu of items inside the Drive folder, plus "Move to <drive>" or
+"Move back to main drive" for a folder when other drives are set up. It asks the
+gdrived daemon over its Unix socket which Drive file a path is, so nothing shows
+outside the folder or while the daemon isn't running.
 
 Installed by gdrived into ~/.local/share/nautilus-python/extensions; it is
 overwritten on every daemon start, so edit packaging/nautilus/gdrive_linux.py in
@@ -67,6 +68,23 @@ def open_uri(uri):
     Gio.AppInfo.launch_default_for_uri(uri, None)
 
 
+def move_entries(items):
+    """Moving a single folder between drives (see the app's "Other drives" settings)."""
+    if len(items) != 1 or not items[0].get("is_dir"):
+        return []
+    item = items[0]
+    folder = item["path"]
+
+    def mover(location):
+        return lambda _menu: request("relocate", folder=folder, location=location)
+
+    if item.get("placed_root"):
+        return [("move-main", "Move back to main drive", mover(None))]
+    if item.get("placed_in"):
+        return []  # inside a folder that is already on another drive
+    return [("move-" + name, "Move to " + name, mover(name)) for name in item.get("locations", [])]
+
+
 class GDriveMenu(GObject.GObject, Nautilus.MenuProvider):
     def get_file_items(self, files):
         if not files or len(files) > MAX_ITEMS:
@@ -96,6 +114,7 @@ class GDriveMenu(GObject.GObject, Nautilus.MenuProvider):
             ("share", "Share…", open_all),
             ("sync", "Sync now", sync),
         ]
+        entries += move_entries(items)
         menu = []
         for key, label, action in entries:
             entry = Nautilus.MenuItem(name="GDriveLinux::" + key, label=label)

@@ -92,6 +92,31 @@ export interface Status {
   /** Version of the running daemon. */
   version: string;
   update: UpdateInfo | null;
+  /** Set while a folder is being moved to or from another drive. */
+  relocation: Relocation | null;
+}
+
+export interface Relocation {
+  /** Drive-relative folder being moved. */
+  folder: string;
+  /** Storage location name, or `null` when moving back to the main drive. */
+  to: string | null;
+  bytes_done: number;
+  /** 0 until known (and for a rename on the same disk). */
+  bytes_total: number;
+}
+
+/** A folder on another disk that can hold some Drive folders. */
+export interface StorageLocation {
+  name: string;
+  root: string;
+}
+
+/** A Drive folder kept on a storage location instead of the main Drive folder. */
+export interface Placement {
+  /** Relative to the Drive root, e.g. `Gaming`. */
+  folder: string;
+  location: string;
 }
 
 /** User configuration (`~/.config/gdrive-linux/config.toml`). */
@@ -108,4 +133,7 @@ export interface Config {
   /** MB/s across all transfers; 0 = unlimited. */
   max_upload_mb_per_sec: number;
   auto_update: boolean;
+  locations: StorageLocation[];
+  /** Changed only by moving folders (`relocateFolder`); the daemon ignores edits. */
+  placements: Placement[];
 }

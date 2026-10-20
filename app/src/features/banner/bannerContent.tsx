@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import type { Status } from '../../api/types';
 import type { IconName } from '../../components/Icon';
 import { RelativeTime } from '../../components/RelativeTime';
-import { plural, speedText } from '../../lib/format';
+import { formatBytes, plural, speedText } from '../../lib/format';
 
 export type BannerTone = 'neutral' | 'ok' | 'busy' | 'warn' | 'error';
 
@@ -30,6 +30,16 @@ export function bannerContent(status: Status | null, loaded: boolean): BannerCon
   const s = status;
   const items = (n: number) => plural(n, 'item', 'items');
   const changes = (n: number) => plural(n, 'change', 'changes');
+
+  if (s.relocation) {
+    const r = s.relocation;
+    const to = r.to ?? 'the main drive';
+    const sub =
+      r.bytes_total > 0
+        ? `${formatBytes(r.bytes_done)} of ${formatBytes(r.bytes_total)} · syncing resumes after`
+        : 'Syncing resumes once it’s done';
+    return { tone: 'busy', icon: 'refresh', spin: true, title: `Moving ${r.folder} to ${to}`, sub };
+  }
 
   switch (s.state) {
     case 'starting':

@@ -1,0 +1,9 @@
+.locations-intro { margin-bottom: 12px; }
+.relocation { display: grid; gap: 6px; margin-bottom: 12px; }
+.add-drive { margin: 12px 0; }
+.add-drive .loc-name { flex: 0 0 120px; }
+.locations-label { font-size: 12.5px; font-weight: 500; color: var(--text-2); margin: 14px 0 6px; }
+.move-form { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.move-start { margin-top: 8px; }
+.move-form select { width: auto; padding: 4px 8px; }
+.location-row + .location-row { margin-top: 8px; }

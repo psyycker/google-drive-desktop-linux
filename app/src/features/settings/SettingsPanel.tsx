@@ -5,6 +5,7 @@ import { AccountCard } from './cards/AccountCard';
 import { CredentialsCard } from './cards/CredentialsCard';
 import { DangerZoneCard } from './cards/DangerZoneCard';
 import { GeneralCard } from './cards/GeneralCard';
+import { StorageLocationsCard } from './cards/StorageLocationsCard';
 import { SyncCard } from './cards/SyncCard';
 import { UpdatesCard } from './cards/UpdatesCard';
 import { SaveBar } from './SaveBar';
@@ -22,6 +23,7 @@ export function SettingsPanel() {
     <div className="settings">
       <AccountCard />
       <SyncCard />
+      <StorageLocationsCard />
       <CredentialsCard />
       <GeneralCard />
       <UpdatesCard />

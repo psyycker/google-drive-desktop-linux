@@ -105,6 +105,7 @@ fn main() {
             commands::sync_now,
             commands::full_resync,
             commands::redownload,
+            commands::relocate_folder,
             commands::start_login,
             commands::sign_out,
             commands::get_config,

@@ -19,6 +19,8 @@ that open in the browser.
 * **Safe by design:** conflicts keep both versions, deletions go to the trash on both sides, and a missing sync folder never wipes Drive.
 * **Native:** a Rust daemon (systemd user service) and a small Tauri tray app; no Electron, no FUSE.
 * **Easy to install:** single-file AppImage, `.deb`, `.rpm` and a headless CLI bundle for x86_64 and aarch64.
+* **Split across disks:** keep chosen folders on another drive (e.g. games on an SSD, the rest on an HDD); they stay visible in the Drive folder.
+* **File manager menu:** in GNOME Files, right-click to open or copy a file's Drive link, sync now, or move a folder to another drive.
 * **Scriptable:** everything the window does is available from the `gdrive` CLI.
 
 Compared with the alternatives: `rclone` is an excellent general tool but has no tray, UI
@@ -72,6 +74,17 @@ caught by the next scan.
 Native Google files (Docs, Sheets, Slides, Forms, Drawings…) become small JSON link
 files; double-clicking opens them in the browser. Deleting or renaming a link file
 deletes/renames the document, like the official client.
+
+### Folders on other drives
+
+Settings → **Other drives** (or `gdrive config location add SSD /mnt/ssd/GDrive`) adds
+a folder on another disk. Moving a Drive folder there (Settings, right-click in Files,
+or `gdrive move Gaming SSD`) copies its files over, then leaves a symlink at its old
+spot so the whole Drive is still browsable from the main folder. Drive itself never
+changes: only where the files sit on disk does. Syncing pauses during a move, and a
+disk that isn't mounted stops syncing with an error instead of deleting anything.
+Moving a file by hand between a folder on one disk and a folder on another (e.g.
+dragging in Files) is a copy across disks, so it is uploaded again as a new file.
 
 Ignored automatically: editor swap/lock files (`.~lock.*#`, `.*.swp`, `*~`, …),
 partial downloads (`*.part`, `*.crdownload`) and the client's own `.gdrive-linux/`
@@ -155,6 +168,8 @@ gdrive sync              # check Drive for changes right now
 gdrive resync            # re-read the whole Drive and rescan the folder
 gdrive config            # show settings
 gdrive config folder ~/Drive
+gdrive config location add SSD /mnt/ssd/GDrive   # another drive for some folders
+gdrive move Gaming SSD   # keep Drive's Gaming folder on it (`main` moves it back)
 gdrive open Report.gdoc  # open a Docs link file in the browser
 gdrive logout            # forget the account (local files stay)
 journalctl --user -u gdrived -f   # daemon logs
@@ -176,7 +191,8 @@ If the project is useful to you, a star helps others find it.
 | `~/.config/gdrive-linux/config.toml` | Settings |
 | `~/.local/share/gdrive-linux/token.json` | OAuth refresh token (mode 0600) |
 | `~/.local/share/gdrive-linux/state.db` | Remote tree + synced tree (SQLite) |
-| `<sync folder>/.gdrive-linux/` | Partial downloads; marker that the folder is the synced one |
+| `<sync folder>/.gdrive-linux/` | Partial downloads; marker that the folder is the synced one (same on each other drive) |
+| `~/.local/share/nautilus-python/extensions/gdrive_linux.py` | GNOME Files menu (installed by the daemon when nautilus-python is present) |
 
 ## Limitations
 
