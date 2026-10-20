@@ -4,6 +4,9 @@
 //! its old, already-mounted copy until it relaunches. It does so on its own only
 //! while the window is hidden, so it never disappears from under the user.
 
+use std::sync::LazyLock;
+use std::time::SystemTime;
+
 use gdrive_core::status::Status;
 use gdrive_core::update::{self, Version};
 use tauri::Manager;
@@ -11,6 +14,19 @@ use tauri::Manager;
 use crate::MAIN_WINDOW;
 
 const REPLACE_PID_ENV: &str = "GDRIVE_REPLACE_PID";
+
+/// When this instance started; forced early in `main` by [`wait_for_replaced_instance`].
+static STARTED: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
+
+/// True when the AppImage we run from was replaced after we started, i.e. relaunching
+/// would actually start a different version. A copy the daemon doesn't update (e.g. a
+/// second AppImage elsewhere) never is, and relaunching it would just loop.
+fn appimage_replaced() -> bool {
+    update::running_appimage()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .is_some_and(|modified| modified > *STARTED)
+}
 
 /// True when the daemon runs a newer version than this app and we can relaunch into it.
 pub fn outdated(status: &Status) -> bool {
@@ -21,6 +37,18 @@ pub fn outdated(status: &Status) -> bool {
 /// Relaunches into the updated AppImage if needed and the window is not on screen.
 pub fn relaunch_if_outdated(app: &tauri::AppHandle, status: &Status) {
     if !outdated(status) {
+        return;
+    }
+    if !appimage_replaced() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            let path = update::running_appimage().map(|p| p.display().to_string()).unwrap_or_default();
+            tracing::warn!(
+                "daemon is {}, app is {}, but {path} hasn't been updated; not relaunching",
+                status.version,
+                update::CURRENT_VERSION
+            );
+        });
         return;
     }
     let visible = app.get_webview_window(MAIN_WINDOW).and_then(|w| w.is_visible().ok()).unwrap_or(false);
@@ -48,6 +76,7 @@ pub fn relaunch(app: &tauri::AppHandle) {
 /// In a relaunched instance, waits for the instance it replaces to exit, so the
 /// single-instance check doesn't hand us straight back to the old copy.
 pub fn wait_for_replaced_instance() {
+    LazyLock::force(&STARTED);
     let Some(pid) = std::env::var(REPLACE_PID_ENV).ok().and_then(|p| p.parse::<u32>().ok()) else { return };
     std::env::remove_var(REPLACE_PID_ENV);
     let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
