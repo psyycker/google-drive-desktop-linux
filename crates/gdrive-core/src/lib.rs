@@ -18,5 +18,6 @@ pub mod engine;
 pub mod gdoc;
 pub mod ipc;
 pub mod local;
+pub mod nautilus;
 pub mod status;
 pub mod update;

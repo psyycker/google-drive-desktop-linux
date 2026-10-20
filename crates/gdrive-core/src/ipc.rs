@@ -3,7 +3,7 @@
 //! Each request is one JSON line and gets exactly one JSON line back. Clients poll
 //! `Status` (it is cheap) rather than subscribing to a stream.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,10 @@ pub enum Request {
     CheckForUpdates,
     GetConfig,
     SetConfig { config: Config },
+    /// Stop syncing and exit the daemon (the app's Quit).
+    Shutdown,
+    /// Which Drive item is synced at an absolute local path. Returns `Item`.
+    Lookup { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +47,7 @@ pub enum Response {
     Status { status: Box<Status> },
     LoginUrl { url: String },
     Config { config: Config },
+    Item { id: String, link: String, is_dir: bool },
     Error { message: String },
 }
 

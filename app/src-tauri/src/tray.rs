@@ -210,7 +210,7 @@ impl ksni::Tray for GDriveTray {
             StandardItem {
                 label: "Quit".into(),
                 icon_name: "application-exit".into(),
-                activate: Box::new(|t: &mut Self| t.app.exit(0)),
+                activate: Box::new(|t: &mut Self| crate::quit(&t.app)),
                 ..Default::default()
             }
             .into(),

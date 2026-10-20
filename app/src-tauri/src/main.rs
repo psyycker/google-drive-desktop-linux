@@ -1,7 +1,7 @@
 //! gdrive-app: the tray icon and status/settings window for gdrive-linux.
 //!
-//! The app is only a client of the `gdrived` daemon (over the IPC socket). Quitting it
-//! never stops syncing.
+//! The app is only a client of the `gdrived` daemon (over the IPC socket). Closing the
+//! window keeps syncing; Quit stops the daemon too.
 
 mod autostart;
 mod commands;
@@ -17,6 +17,21 @@ use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tokio::sync::Notify;
 
 pub const MAIN_WINDOW: &str = "main";
+
+/// Quits the app and stops the daemon with it, so nothing keeps syncing in the
+/// background. Relaunching after an update exits without this and leaves it running.
+pub fn quit(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let stop = daemon::call(gdrive_core::ipc::Request::Shutdown);
+        match tokio::time::timeout(std::time::Duration::from_secs(3), stop).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("could not stop the daemon: {e:#}"),
+            Err(_) => tracing::warn!("the daemon did not answer the shutdown request"),
+        }
+        app.exit(0);
+    });
+}
 
 /// Shared app state: lets anything (tray menu, commands) ask the tray poller to
 /// refresh right away instead of waiting for the next tick.

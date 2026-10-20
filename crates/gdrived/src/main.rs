@@ -31,6 +31,8 @@ struct Daemon {
     login: Option<tokio::task::JoinHandle<()>>,
     /// Wakes the updater for an immediate check.
     check_updates: Arc<tokio::sync::Notify>,
+    /// Ends the main loop, as SIGTERM does.
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 type Shared = Arc<Mutex<Daemon>>;
@@ -102,6 +104,12 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
             d.check_updates.notify_one();
             Response::Ok
         }
+        Request::Lookup { path } => lookup(&d, &path)?,
+        Request::Shutdown => {
+            tracing::info!("shutdown requested");
+            d.shutdown.notify_one();
+            Response::Ok
+        }
         Request::SetConfig { config } => {
             apply_config(&mut d, config).await?;
             Response::Ok
@@ -130,6 +138,22 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
             Response::Ok
         }
     })
+}
+
+/// The Drive item synced at `path`, for the file manager's right-click menu.
+fn lookup(d: &Daemon, path: &std::path::Path) -> Result<Response> {
+    let Some(rel) = path.strip_prefix(&d.config.sync_root).ok().filter(|r| !r.as_os_str().is_empty()) else {
+        bail!("{} is not inside the Drive folder", path.display());
+    };
+    let db = Db::open(&config::db_file())?;
+    let Some(synced) = db.synced_by_path(rel)? else {
+        bail!("{} is not synced yet", rel.display());
+    };
+    let link = db
+        .get_remote(&synced.id)?
+        .and_then(|r| r.link)
+        .unwrap_or_else(|| gdrive_core::nautilus::fallback_link(&synced.id, synced.is_dir));
+    Ok(Response::Item { id: synced.id, link, is_dir: synced.is_dir })
 }
 
 /// Wipes the sync folder and the sync state, then restarts the engine, which sees an
@@ -286,6 +310,7 @@ async fn main() -> Result<()> {
         .read_timeout(std::time::Duration::from_secs(120))
         .build()?;
     let check_updates = Arc::new(tokio::sync::Notify::new());
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     let daemon: Shared = Arc::new(Mutex::new(Daemon {
         config,
         http: http.clone(),
@@ -294,6 +319,7 @@ async fn main() -> Result<()> {
         bandwidth: None,
         login: None,
         check_updates: check_updates.clone(),
+        shutdown: shutdown.clone(),
     }));
     tokio::spawn(updater::run(daemon.clone(), http, check_updates));
     {
@@ -304,6 +330,11 @@ async fn main() -> Result<()> {
         }
     }
     tracing::info!("listening on {}", config::socket_path().display());
+    match gdrive_core::nautilus::install_extension() {
+        Ok(true) => tracing::info!("installed the Files right-click menu; it shows once Files restarts (nautilus -q)"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("cannot install the Files right-click menu: {e:#}"),
+    }
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
@@ -319,6 +350,7 @@ async fn main() -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
+            _ = shutdown.notified() => break,
         }
     }
     tracing::info!("shutting down");
