@@ -193,41 +193,68 @@ Open **Google Drive (gdrive-linux)** from the app grid, paste the client ID and
 secret, then click **Sign in**. Or from a terminal:
 
 ```sh
+gdrive setup
+```
+
+`gdrive setup` goes through everything in order, and skips what is already done, so
+it is safe to run again:
+
+1. starts the background service, and has it start at login (installing a systemd
+   user unit if the package didn't ship one);
+2. walks through creating the Google Cloud project and OAuth client of section 1,
+   page by page, with links that open in your project; then it finds the
+   `client_secret_*.json` you downloaded to `~/Downloads`, or asks for the JSON's
+   path or for the ID and secret;
+3. asks where the files go (`~/GoogleDrive` by default);
+4. prints the sign-in address and what Google will show (including the "unverified
+   app" warning). With the browser on another computer, paste back the address of the
+   page that fails to load and it finishes the sign-in. If Google refuses, it says
+   what to change in the console and tries again;
+5. checks that your Drive can actually be read, and if not (the Drive API is off,
+   access to files wasn't allowed), says how to fix it and checks again;
+6. lists your Drive's folders to choose from (`2/` looks inside folder 2, `..` goes
+   back, `all` syncs the whole Drive).
+
+For scripted installs, flags answer the questions:
+`gdrive setup --client-json FILE --local-folder ~/Drive --sync Work --sync Photos --yes`
+(or `--client-id ID --client-secret SECRET`, `--whole-drive`). Signing in still needs
+a browser once.
+
+The individual steps are also commands of their own:
+
+```sh
 gdrive config client <CLIENT_ID> <CLIENT_SECRET>
 gdrive login          # opens the browser
-gdrive status         # wait until the Drive has been read
-gdrive folders browse # then choose what to download (see "Selected folders")
+gdrive folders browse # choose what to download (see "Selected folders")
 gdrive folders add Work
 ```
 
 ### Without a desktop (servers, SSH)
 
-Everything works from a terminal. Install the terminal-only package, then start the
-service as the user who syncs:
+Everything works from a terminal. Install the terminal-only package, then run
+`gdrive setup` as the user who syncs:
 
 ```sh
 sudo apt install ./gdrive-linux-cli_<version>-1_amd64.deb      # Debian, Ubuntu
 sudo dnf install ./gdrive-linux-cli-<version>-1.x86_64.rpm     # Fedora, RHEL
-
-systemctl --user enable --now gdrived
-sudo loginctl enable-linger "$USER"   # keep syncing while you're logged out
+gdrive setup
 ```
 
+Over SSH it also offers to keep syncing after you log out (`loginctl enable-linger`).
 Without a package manager, use the `-cli.tar.gz` bundle instead:
 
 ```sh
 install -m755 gdrived gdrive ~/.local/bin/
-install -Dm644 gdrived.service ~/.config/systemd/user/gdrived.service
-systemctl --user enable --now gdrived
+gdrive setup
 ```
 
 To build the packages yourself: `cargo build --release -p gdrived -p gdrive-cli`, then
 `scripts/cli-packages.sh` (needs [nfpm](https://nfpm.goreleaser.com)).
 
-`gdrive login` prints the sign-in address. Google sends the browser back to
-`http://127.0.0.1:<port>` on the machine running the daemon, so with the browser on
-another computer, that last page fails to load. Copy its address from the address bar
-and finish on the server with `curl '<address>'`, or forward the port beforehand
+Google sends the browser back to `http://127.0.0.1:<port>` on the machine running the
+daemon, so with the browser on another computer, that last page fails to load. Copy its
+address from the address bar and paste it into `gdrive setup`. With `gdrive login`,
+finish on the server with `curl '<address>'` instead, or forward the port beforehand
 (`ssh -L <port>:127.0.0.1:<port> server`, the port is in the printed address).
 
 ## Everyday use
@@ -238,6 +265,7 @@ gdrive pause | resume
 gdrive folders           # which Drive folders are synced (see "Selected folders")
 gdrive sync              # check Drive for changes right now
 gdrive resync            # re-read the whole Drive and rescan the folder
+gdrive update            # install the newest release (--check to only look)
 gdrive config            # show settings
 gdrive config folder ~/Drive
 gdrive config location add SSD /mnt/ssd/GDrive   # another drive for some folders

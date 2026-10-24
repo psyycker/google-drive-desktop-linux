@@ -172,13 +172,20 @@ pub fn db_file() -> PathBuf {
     data_dir().join("state.db")
 }
 
+/// Where the daemon listens. The daemon (started by systemd) and its clients must agree
+/// even when a client's shell lacks `XDG_RUNTIME_DIR` (after `su`, in cron, some SSH
+/// setups), so without it the per-user runtime directory is looked up directly.
 pub fn socket_path() -> PathBuf {
-    match dirs::runtime_dir() {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    socket_path_in(dirs::runtime_dir(), Path::new(&format!("/run/user/{uid}")), uid)
+}
+
+fn socket_path_in(runtime_dir: Option<PathBuf>, user_run_dir: &Path, uid: u32) -> PathBuf {
+    match runtime_dir {
         Some(dir) => dir.join("gdrive-linux.sock"),
-        None => {
-            let uid = std::env::var("UID").unwrap_or_else(|_| "user".into());
-            PathBuf::from(format!("/tmp/gdrive-linux-{uid}.sock"))
-        }
+        None if user_run_dir.is_dir() => user_run_dir.join("gdrive-linux.sock"),
+        None => PathBuf::from(format!("/tmp/gdrive-linux-{uid}.sock")),
     }
 }
 
@@ -218,6 +225,19 @@ mod tests {
         assert_eq!(Config::default().selected_folders, Some(Vec::new()));
         let old: Config = toml::from_str("client_id = \"x\"\nsync_root = \"/d\"\n").unwrap();
         assert_eq!(old.selected_folders, None);
+    }
+
+    #[test]
+    fn socket_is_found_without_xdg_runtime_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run-user-1000");
+        let from_env = socket_path_in(Some("/run/user/1000".into()), &run, 1000);
+        assert_eq!(from_env, Path::new("/run/user/1000/gdrive-linux.sock"));
+        // No runtime dir in the environment, no per-user one either: a uid-specific /tmp path.
+        assert_eq!(socket_path_in(None, &run, 1000), Path::new("/tmp/gdrive-linux-1000.sock"));
+        // The per-user runtime dir exists: the same spot the daemon uses.
+        std::fs::create_dir(&run).unwrap();
+        assert_eq!(socket_path_in(None, &run, 1000), run.join("gdrive-linux.sock"));
     }
 
     #[test]

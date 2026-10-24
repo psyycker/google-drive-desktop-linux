@@ -9,6 +9,9 @@ use gdrive_core::gdoc;
 use gdrive_core::ipc::{self, Coverage, Request, Response};
 use gdrive_core::status::{human_bytes, Direction, SyncState, UpdatePhase};
 
+mod setup;
+mod update;
+
 #[derive(Parser)]
 #[command(name = "gdrive", version, about = "Control the gdrive-linux sync daemon")]
 struct Cli {
@@ -18,6 +21,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Set everything up step by step: background service, Google client, sign-in and
+    /// folders. Safe to run again; finished steps are skipped.
+    Setup(setup::SetupArgs),
     /// Show sync status, transfers and recent activity.
     Status {
         /// Number of recent activity lines to show.
@@ -39,8 +45,16 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Check for a new version now (AppImage installs update themselves when idle).
-    Update,
+    /// Install the newest version from GitHub: the right package for how this was
+    /// installed (deb or rpm, desktop or terminal-only, tarball, AppImage).
+    Update {
+        /// Only say whether there is a newer version.
+        #[arg(long)]
+        check: bool,
+        /// Install without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Sign in to a Google account (opens the browser).
     Login,
     /// Sign out and forget sync state (local files are kept).
@@ -138,8 +152,8 @@ enum LocationCmd {
 async fn status(recent: usize) -> Result<()> {
     let Response::Status { status: st } = ipc::call(&Request::Status).await? else { bail!("unexpected reply") };
     let state = match st.state {
-        SyncState::SetupRequired => "Setup required (run `gdrive config client <id> <secret>`)",
-        SyncState::SignedOut => "Signed out (run `gdrive login`)",
+        SyncState::SetupRequired => "Setup required (run `gdrive setup`)",
+        SyncState::SignedOut => "Signed out (run `gdrive setup` or `gdrive login`)",
         SyncState::SigningIn => "Waiting for browser sign-in",
         SyncState::Starting => "Starting",
         SyncState::Idle => "Up to date",
@@ -173,7 +187,7 @@ async fn status(recent: usize) -> Result<()> {
     if let Some(u) = &st.update {
         let what = match u.phase {
             UpdatePhase::Available if u.automatic => "available; installs when syncing is idle".to_owned(),
-            UpdatePhase::Available => format!("available: {}", u.release_url),
+            UpdatePhase::Available => "available: run `gdrive update`".to_owned(),
             UpdatePhase::Downloading => format!("downloading ({} of {})", human_bytes(u.bytes_done), human_bytes(u.bytes_total)),
             UpdatePhase::Installing => "installing".to_owned(),
             UpdatePhase::Failed => format!("failed: {}", u.message.as_deref().unwrap_or("unknown error")),
@@ -357,6 +371,7 @@ fn open_link(file: &Path) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Cmd::Setup(args) => setup::run(args).await?,
         Cmd::Status { recent } => status(recent).await?,
         Cmd::Pause => drop(ipc::call(&Request::Pause).await?),
         Cmd::Resume => drop(ipc::call(&Request::Resume).await?),
@@ -369,10 +384,7 @@ async fn main() -> Result<()> {
             ipc::call(&Request::Redownload).await?;
             println!("Sync folder cleared; downloading everything again.");
         }
-        Cmd::Update => {
-            ipc::call(&Request::CheckForUpdates).await?;
-            println!("Checking for updates… run `gdrive status` in a few seconds to see the result.");
-        }
+        Cmd::Update { check, yes } => update::run(check, yes).await?,
         Cmd::Login => {
             if let Response::LoginUrl { url } = ipc::call(&Request::StartLogin).await? {
                 println!("Opening your browser to sign in. If it didn't open, visit:\n\n  {url}\n");

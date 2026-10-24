@@ -1,8 +1,9 @@
 //! Update checks against GitHub Releases, and self-replacement for AppImage installs.
 //!
-//! Only an AppImage can safely update itself: it's one user-owned file, and running
-//! processes keep their already-mounted copy while the file is atomically replaced.
-//! Package-manager installs (.deb/.rpm) and source builds only get notified.
+//! Only an AppImage can safely update itself in the background: it's one user-owned
+//! file, and running processes keep their already-mounted copy while the file is
+//! atomically replaced. The daemon only notifies package-manager installs (.deb/.rpm);
+//! `gdrive update` installs those, with the user's go-ahead (and sudo).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -19,6 +20,7 @@ use crate::api::Progress;
 pub const REPO: &str = "psyycker/google-drive-desktop-linux";
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_API: &str = "https://api.github.com";
+const GITHUB_WEB: &str = "https://github.com";
 
 /// A `major.minor.patch` version; pre-release/build suffixes are ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,7 +67,7 @@ impl Release {
         Version::parse(&self.tag_name)
     }
 
-    fn asset(&self, name: &str) -> Option<&Asset> {
+    pub fn asset(&self, name: &str) -> Option<&Asset> {
         self.assets.iter().find(|a| a.name == name)
     }
 
@@ -78,6 +80,44 @@ impl Release {
 
 pub fn appimage_asset_name(version: &Version) -> String {
     format!("gdrive-linux-{version}-{}.AppImage", std::env::consts::ARCH)
+}
+
+/// The packages a release ships, besides the AppImage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageFormat {
+    Deb,
+    Rpm,
+}
+
+/// The package names the release workflow builds: the desktop app, and the
+/// terminal-only edition.
+pub const DESKTOP_PACKAGE: &str = "gdrive-linux";
+pub const CLI_PACKAGE: &str = "gdrive-linux-cli";
+
+/// Release file of `package` for `arch` (as in `std::env::consts::ARCH`). The names
+/// follow each tool's conventions: Tauri names the desktop .deb without a release
+/// number, nfpm adds `-1`; Debian calls the architectures amd64/arm64.
+pub fn package_asset_name(package: &str, format: PackageFormat, version: &Version, arch: &str) -> Option<String> {
+    if package != DESKTOP_PACKAGE && package != CLI_PACKAGE {
+        return None;
+    }
+    Some(match format {
+        PackageFormat::Deb => {
+            let arch = match arch {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                _ => return None,
+            };
+            let release = if package == CLI_PACKAGE { "-1" } else { "" };
+            format!("{package}_{version}{release}_{arch}.deb")
+        }
+        PackageFormat::Rpm => format!("{package}-{version}-1.{arch}.rpm"),
+    })
+}
+
+/// The terminal-only tarball (`gdrived`, `gdrive`, the systemd unit) for `arch`.
+pub fn cli_tarball_name(version: &Version, arch: &str) -> String {
+    format!("gdrive-linux-{version}-{arch}-cli.tar.gz")
 }
 
 /// The AppImage file this process was started from, if any.
@@ -188,13 +228,57 @@ impl Updater {
         Self::with_api_base(http, GITHUB_API)
     }
 
+    /// For a program without an HTTP client of its own (the CLI).
+    pub fn standalone() -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("gdrive-linux/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(15))
+            .build()?;
+        Ok(Self::new(http))
+    }
+
     /// Like [`Updater::new`] against another API host (used by tests).
     pub fn with_api_base(http: reqwest::Client, api_base: &str) -> Self {
         Self { http, api_base: api_base.trim_end_matches('/').to_owned() }
     }
 
-    /// The newest published, non-prerelease release.
+    /// The newest published, non-prerelease release. When the API refuses (it allows 60
+    /// requests an hour per address without a token), the release is read from the
+    /// website instead.
     pub async fn latest(&self) -> Result<Release> {
+        match self.latest_from_api().await {
+            Ok(release) => Ok(release),
+            Err(api_err) if self.api_base == GITHUB_API => {
+                self.latest_from_web().await.map_err(|_| api_err)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `/releases/latest` on the website redirects to the newest release's tag, and its
+    /// `SHA256SUMS` lists every file of it. Sizes aren't known this way (0).
+    async fn latest_from_web(&self) -> Result<Release> {
+        let resp = self.http.get(format!("{GITHUB_WEB}/{REPO}/releases/latest")).send().await?.error_for_status()?;
+        let html_url = resp.url().to_string();
+        let tag = html_url
+            .rsplit_once("/tag/")
+            .map(|(_, t)| t.to_owned())
+            .ok_or_else(|| anyhow!("GitHub didn't point to a release"))?;
+        let download = |name: &str| format!("{GITHUB_WEB}/{REPO}/releases/download/{tag}/{name}");
+        let sums = self.http.get(download("SHA256SUMS")).send().await?.error_for_status()?.text().await?;
+        let mut assets: Vec<Asset> = sums
+            .lines()
+            .filter_map(|l| l.split_once(char::is_whitespace))
+            .map(|(_, name)| {
+                let name = name.trim().trim_start_matches('*').to_owned();
+                Asset { browser_download_url: download(&name), name, size: 0 }
+            })
+            .collect();
+        assets.push(Asset { name: "SHA256SUMS".into(), browser_download_url: download("SHA256SUMS"), size: 0 });
+        Ok(Release { tag_name: tag, html_url, assets })
+    }
+
+    async fn latest_from_api(&self) -> Result<Release> {
         let url = format!("{}/repos/{REPO}/releases/latest", self.api_base);
         let resp = self
             .http
@@ -211,6 +295,16 @@ impl Updater {
     /// against the release's `SHA256SUMS`, and marks it executable.
     pub async fn download_appimage(&self, release: &Release, dest: &Path, progress: &Progress) -> Result<()> {
         let asset = release.appimage().ok_or_else(|| anyhow!("release has no AppImage for this architecture"))?;
+        self.download(release, &asset.name, dest, progress).await?;
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).await?;
+        Ok(())
+    }
+
+    /// Downloads the release file `name` to `dest`, verifying its size (when known) and
+    /// SHA-256 against the release's `SHA256SUMS`. A failed download leaves nothing.
+    pub async fn download(&self, release: &Release, name: &str, dest: &Path, progress: &Progress) -> Result<()> {
+        let asset = release.asset(name).ok_or_else(|| anyhow!("release {} has no {name}", release.tag_name))?;
         let sums = release.asset("SHA256SUMS").ok_or_else(|| anyhow!("release has no SHA256SUMS"))?;
         let sums = self.http.get(&sums.browser_download_url).send().await?.error_for_status()?.text().await?;
         let expected = sums
@@ -235,15 +329,13 @@ impl Updater {
                 progress.store(written, Ordering::Relaxed);
             }
             file.sync_all().await?;
-            if written != asset.size {
+            if asset.size != 0 && written != asset.size {
                 bail!("download is {written} bytes, expected {}", asset.size);
             }
             let actual = hex::encode(hasher.finalize());
             if actual != expected {
                 bail!("checksum mismatch for {} (got {actual}, expected {expected})", asset.name);
             }
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).await?;
             Ok(())
         }
         .await;
@@ -302,5 +394,44 @@ mod tests {
     fn asset_name_matches_release_workflow() {
         let name = appimage_asset_name(&Version(0, 2, 0));
         assert_eq!(name, format!("gdrive-linux-0.2.0-{}.AppImage", std::env::consts::ARCH));
+    }
+
+    /// The files of the real 0.5.0 release, from its SHA256SUMS.
+    const RELEASE_0_5_0: &[&str] = &[
+        "gdrive-linux-0.5.0-1.aarch64.rpm",
+        "gdrive-linux-0.5.0-1.x86_64.rpm",
+        "gdrive-linux-0.5.0-aarch64-cli.tar.gz",
+        "gdrive-linux-0.5.0-aarch64.AppImage",
+        "gdrive-linux-0.5.0-x86_64-cli.tar.gz",
+        "gdrive-linux-0.5.0-x86_64.AppImage",
+        "gdrive-linux-cli-0.5.0-1.aarch64.rpm",
+        "gdrive-linux-cli-0.5.0-1.x86_64.rpm",
+        "gdrive-linux-cli_0.5.0-1_amd64.deb",
+        "gdrive-linux-cli_0.5.0-1_arm64.deb",
+        "gdrive-linux_0.5.0_amd64.deb",
+        "gdrive-linux_0.5.0_arm64.deb",
+    ];
+
+    #[test]
+    fn each_install_finds_its_own_file_in_a_release() {
+        let v = Version(0, 5, 0);
+        let mut found = Vec::new();
+        for arch in ["x86_64", "aarch64"] {
+            for format in [PackageFormat::Deb, PackageFormat::Rpm] {
+                for package in [DESKTOP_PACKAGE, CLI_PACKAGE] {
+                    found.push(package_asset_name(package, format, &v, arch).unwrap());
+                }
+            }
+            found.push(cli_tarball_name(&v, arch));
+            found.push(format!("gdrive-linux-0.5.0-{arch}.AppImage"));
+        }
+        found.sort();
+        let mut release: Vec<String> = RELEASE_0_5_0.iter().map(|s| s.to_string()).collect();
+        release.sort();
+        // One distinct file per kind of install, and every file is somebody's.
+        assert_eq!(found, release);
+        assert_eq!(package_asset_name("gdrive-linux", PackageFormat::Deb, &v, "x86_64").unwrap(), "gdrive-linux_0.5.0_amd64.deb");
+        assert_eq!(package_asset_name("something-else", PackageFormat::Rpm, &v, "x86_64"), None);
+        assert_eq!(package_asset_name(CLI_PACKAGE, PackageFormat::Deb, &v, "riscv64"), None);
     }
 }

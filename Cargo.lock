@@ -1510,6 +1510,8 @@ dependencies = [
  "chrono",
  "clap",
  "gdrive-core",
+ "libc",
+ "serde_json",
  "tokio",
 ]
 

@@ -106,7 +106,12 @@ pub async fn request(req: &Request) -> Result<Response> {
 pub async fn request_at(socket: &Path, req: &Request) -> Result<Response> {
     let stream = UnixStream::connect(socket)
         .await
-        .with_context(|| format!("cannot reach gdrived at {} (is it running?)", socket.display()))?;
+        .with_context(|| {
+            format!(
+                "cannot reach gdrived at {}; run `gdrive setup` to start it",
+                socket.display()
+            )
+        })?;
     let (read, mut write) = stream.into_split();
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
