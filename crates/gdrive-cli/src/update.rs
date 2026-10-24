@@ -141,10 +141,9 @@ pub async fn run(check_only: bool, yes: bool) -> Result<()> {
         bail!("installed, but {} still reports {:?}; check the output above", exe.display(), reported);
     }
     println!("✓ Updated to {latest}");
-    if let Install::Package { name, .. } = &install {
-        if name == update::DESKTOP_PACKAGE {
-            println!("  Quit and reopen the Google Drive app to use the new version of the window.");
-        }
+    // Only worth saying to someone who has the window open.
+    if app_running() {
+        println!("  Quit and reopen the Google Drive app to use the new version of the window.");
     }
     restart_stale_daemon(&latest).await?;
     // Only the new version knows which setup steps it added.
@@ -155,6 +154,17 @@ pub async fn run(check_only: bool, yes: bool) -> Result<()> {
     }
     let _ = setup.status();
     Ok(())
+}
+
+/// Whether the desktop app (the window and tray) is running for this user.
+fn app_running() -> bool {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    Command::new("pgrep")
+        .args(["-x", "-u", &uid.to_string(), "gdrive-app"])
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn confirm(question: &str) -> Result<bool> {
