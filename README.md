@@ -266,6 +266,7 @@ finish on the server with `curl '<address>'` instead, or forward the port before
 
 ```sh
 gdrive status            # state, account, quota, transfers, errors, recent activity
+gdrive top               # live view: progress of every transfer, what was downloaded, problems
 gdrive pause | resume
 gdrive folders           # which Drive folders are synced (see "Selected folders")
 gdrive sync              # check Drive for changes right now

@@ -12,6 +12,7 @@ use gdrive_core::status::{human_bytes, Direction, SyncState, UpdatePhase};
 
 mod picker;
 mod setup;
+mod top;
 mod update;
 
 #[derive(Parser)]
@@ -26,6 +27,8 @@ enum Cmd {
     /// Set everything up step by step: background service, Google client, sign-in and
     /// folders. Safe to run again; finished steps are skipped.
     Setup(setup::SetupArgs),
+    /// Live view of transfers, progress and recent activity, refreshed every second.
+    Top,
     /// Show sync status, transfers and recent activity.
     Status {
         /// Number of recent activity lines to show.
@@ -386,6 +389,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Setup(args) => setup::run(args).await?,
+        Cmd::Top => top::run().await?,
         Cmd::Status { recent } => status(recent).await?,
         Cmd::Pause => drop(ipc::call(&Request::Pause).await?),
         Cmd::Resume => drop(ipc::call(&Request::Resume).await?),

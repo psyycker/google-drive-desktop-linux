@@ -17,10 +17,10 @@ pub type Selection = Option<Vec<PathBuf>>;
 
 /// Raw mode and the alternate screen, undone on drop (also on errors and panics
 /// unwinding through the picker).
-struct Screen(Stdout);
+pub(crate) struct Screen(pub(crate) Stdout);
 
 impl Screen {
-    fn enter() -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
         let mut out = std::io::stdout();
         execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
