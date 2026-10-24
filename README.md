@@ -212,13 +212,18 @@ it is safe to run again:
    what to change in the console and tries again;
 5. checks that your Drive can actually be read, and if not (the Drive API is off,
    access to files wasn't allowed), says how to fix it and checks again;
-6. opens a folder picker: ↑/↓ to move, → to open a folder, ← to close it, Space to
-   tick it, `a` for the whole Drive, Enter to save.
+6. asks whether to **mirror** (download the whole Drive and keep it all in sync) or
+   **stream** (download only the folders you choose). To stream, choose the folders
+   once setup is done with `gdrive folders browse`: ↑/↓ to move, → to open a folder,
+   ← to close it, Space to tick it, Enter to save.
+
+`gdrive update` runs whatever setup a new version adds (only what isn't done yet), so
+there's no need to run `gdrive setup` again after updating.
 
 For scripted installs, flags answer the questions:
-`gdrive setup --client-json FILE --local-folder ~/Drive --sync Work --sync Photos --yes`
-(or `--client-id ID --client-secret SECRET`, `--whole-drive`). Signing in still needs
-a browser once.
+`gdrive setup --client-json FILE --local-folder ~/Drive --mode mirror --yes`
+(or `--client-id ID --client-secret SECRET`; `--mode stream`, or `--sync Work --sync
+Photos` to stream those folders). Signing in still needs a browser once.
 
 The individual steps are also commands of their own:
 

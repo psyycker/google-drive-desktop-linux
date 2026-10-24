@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use gdrive_core::config::Config;
 use gdrive_core::ipc::{self, Request, Response};
-use gdrive_core::status::{Status, SyncState};
+use gdrive_core::status::{human_bytes, Status, SyncState};
 
 #[derive(Args, Default)]
 pub struct SetupArgs {
@@ -27,16 +27,64 @@ pub struct SetupArgs {
     /// Local folder to sync into (default ~/GoogleDrive).
     #[arg(long)]
     local_folder: Option<PathBuf>,
-    /// A Drive folder to sync, like `Work/Reports`; repeat for more.
-    #[arg(long = "sync", value_name = "FOLDER", conflicts_with = "whole_drive")]
+    /// Mirror (download the whole Drive) or stream (only the folders you choose).
+    #[arg(long, value_enum, conflicts_with = "whole_drive")]
+    mode: Option<Mode>,
+    /// Stream, starting with this Drive folder, like `Work/Reports`; repeat for more.
+    #[arg(long = "sync", value_name = "FOLDER", conflicts_with_all = ["whole_drive", "mode"])]
     sync: Vec<PathBuf>,
-    /// Sync the whole Drive.
-    #[arg(long)]
+    /// Same as `--mode mirror` (kept for scripts written for 0.5.1).
+    #[arg(long, hide = true)]
     whole_drive: bool,
+    /// Run by `gdrive update` with the new version: only the steps that version added.
+    #[arg(long, hide = true)]
+    after_update: bool,
     /// Accept the default answer to every question (needs the client from flags or
     /// already configured).
     #[arg(short, long)]
     yes: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mode {
+    /// Download everything on the Drive and keep it all in sync.
+    Mirror,
+    /// Download only the folders you choose afterwards.
+    Stream,
+}
+
+/// Setup steps whose answer can't be told from the daemon's state, recorded once done
+/// so they aren't asked again (by a later `gdrive setup`, or after an update).
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Done {
+    #[serde(default)]
+    steps: Vec<String>,
+}
+
+const MODE_STEP: &str = "sync-mode";
+
+fn done_file() -> PathBuf {
+    gdrive_core::config::config_dir().join("setup-done.json")
+}
+
+impl Done {
+    fn load() -> Self {
+        std::fs::read_to_string(done_file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    fn has(&self, step: &str) -> bool {
+        self.steps.iter().any(|s| s == step)
+    }
+
+    fn mark(step: &str) -> Result<()> {
+        let mut done = Self::load();
+        if !done.has(step) {
+            done.steps.push(step.to_owned());
+            std::fs::create_dir_all(gdrive_core::config::config_dir())?;
+            std::fs::write(done_file(), serde_json::to_string_pretty(&done)?)?;
+        }
+        Ok(())
+    }
 }
 
 const STEPS: usize = 6;
@@ -105,6 +153,9 @@ impl Ui {
 
 pub async fn run(args: SetupArgs) -> Result<()> {
     let mut ui = Ui::new(args.yes);
+    if args.after_update {
+        return after_update(&mut ui).await;
+    }
     println!("Setting up Google Drive sync. Finished steps are skipped, so this can be run again any time.");
 
     ui.step(1, "Background service");
@@ -124,14 +175,13 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     ui.step(5, "Drive access");
     check_drive(&mut ui).await?;
 
-    ui.step(6, "Folders to sync");
-    choose_folders(&mut ui, &args).await?;
+    ui.step(6, "Mirror or stream");
+    choose_mode(&mut ui, &args).await?;
 
     let st = status().await?;
     if st.selected_folders == Some(0) {
-        println!("\nAll set, but nothing syncs until you choose folders:");
-        println!("  gdrive folders browse          see what's in your Drive");
-        println!("  gdrive folders add <folder>    sync one into {}", st.sync_root);
+        println!("\nAll set. Now choose the folders to stream to {}:", st.sync_root);
+        println!("  gdrive folders browse");
     } else {
         println!("\nAll set: syncing into {}. It keeps running in the background.", st.sync_root);
         println!("  gdrive status     follow progress");
@@ -720,56 +770,102 @@ async fn list(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(folders.into_iter().map(|f| f.path).collect())
 }
 
-async fn choose_folders(ui: &mut Ui, args: &SetupArgs) -> Result<()> {
-    let flagged = if args.whole_drive {
-        Some(None)
-    } else if !args.sync.is_empty() {
-        Some(Some(args.sync.clone()))
-    } else {
-        None
+/// Mirror (`None`) or stream, as the folder selection says, when that answers it:
+/// a whole-Drive selection or chosen folders mean the question was settled.
+fn mode_of(selected: Option<usize>, done: &Done) -> Option<Mode> {
+    match selected {
+        None => Some(Mode::Mirror),
+        Some(0) if !done.has(MODE_STEP) => None,
+        Some(_) => Some(Mode::Stream),
+    }
+}
+
+async fn choose_mode(ui: &mut Ui, args: &SetupArgs) -> Result<()> {
+    let st = status().await?;
+    let flagged = match (args.mode, args.whole_drive, args.sync.is_empty()) {
+        (Some(m), _, _) => Some(m),
+        (None, true, _) => Some(Mode::Mirror),
+        (None, false, false) => Some(Mode::Stream),
+        (None, false, true) => None,
     };
-    let current = status().await?.selected_folders;
-    if flagged.is_none() {
-        let changing = match current {
-            None => {
-                println!("  ✓ Syncing your whole Drive");
-                ui.confirm("Sync only some folders instead?", false).await?
-            }
-            Some(0) => true,
-            Some(n) => {
-                println!("  ✓ Syncing {n} chosen folder(s) (`gdrive folders` lists them)");
-                ui.confirm("Change them?", false).await?
-            }
-        };
-        if !changing {
+    let mode = match (flagged, mode_of(st.selected_folders, &Done::load())) {
+        (None, Some(Mode::Mirror)) => {
+            println!("  ✓ Mirroring your whole Drive (stream only some folders with `gdrive folders browse`)");
             return Ok(());
+        }
+        (None, Some(Mode::Stream)) => {
+            match st.selected_folders.unwrap_or(0) {
+                0 => println!("  ✓ Streaming; no folders chosen yet"),
+                n => println!("  ✓ Streaming {n} chosen folder(s) (`gdrive folders browse` changes them)"),
+            }
+            return Ok(());
+        }
+        (Some(m), _) => m,
+        (None, None) if !ui.interactive || ui.yes => {
+            println!("  Streaming for now: nothing downloads until you choose folders with `gdrive folders browse`.");
+            println!("  To download everything instead: `gdrive folders all`.");
+            return Ok(());
+        }
+        (None, None) => ask_mode(ui, &st).await?,
+    };
+    match mode {
+        Mode::Mirror => {
+            ipc::call(&Request::SetFolders { folders: None }).await?;
+            println!("  ✓ Mirroring your whole Drive");
+        }
+        Mode::Stream if !args.sync.is_empty() => {
+            ipc::call(&Request::SetFolders { folders: Some(args.sync.clone()) }).await?;
+            let names: Vec<String> = args.sync.iter().map(|p| p.display().to_string()).collect();
+            println!("  ✓ Streaming {}", names.join(", "));
+        }
+        Mode::Stream => {
+            // Switching from a mirror would remove every local copy; that's the
+            // picker's job, with its confirmation.
+            if st.selected_folders.is_none() {
+                println!("  You're mirroring now: choose what to keep with `gdrive folders browse`.");
+                return Ok(());
+            }
+            println!("  ✓ Streaming: choose the folders once setup is done");
         }
     }
-    let choice = match flagged {
-        Some(choice) => choice,
-        None if !ui.interactive || ui.yes || !std::io::stdout().is_terminal() => {
-            println!("  No folders chosen yet: pick some later with `gdrive folders browse`.");
-            return Ok(());
+    Done::mark(MODE_STEP)
+}
+
+async fn ask_mode(ui: &mut Ui, st: &Status) -> Result<Mode> {
+    let size = st
+        .quota
+        .as_ref()
+        .map(|q| format!(" (your Google storage holds {} in all)", human_bytes(q.used)))
+        .unwrap_or_default();
+    println!("  How should this computer keep your Drive?");
+    println!("   1. Mirror: download everything and keep it all in sync{size}.");
+    println!("   2. Stream: download only the folders you choose; the rest stays online.");
+    loop {
+        let answer = ui.ask("Mirror or stream? [1/2]").await?.unwrap_or_default();
+        match answer.to_lowercase().as_str() {
+            "1" | "m" | "mirror" => return Ok(Mode::Mirror),
+            "2" | "s" | "stream" => return Ok(Mode::Stream),
+            _ => println!("  Please answer 1 or 2."),
         }
-        None => {
-            let Response::Folders { folders } = ipc::call(&Request::GetFolders).await? else { bail!("unexpected reply") };
-            let saved = folders.map(|sel| sel.into_iter().map(|f| f.path).collect());
-            match crate::picker::pick(saved).await? {
-                Some(choice) => choice,
-                None => {
-                    println!("  Left as it was; choose later with `gdrive folders browse`.");
-                    return Ok(());
-                }
-            }
+    }
+}
+
+/// After an update: the steps this version added that haven't been done, and nothing
+/// when there are none. Setup that was never finished is left to `gdrive setup`.
+async fn after_update(ui: &mut Ui) -> Result<()> {
+    let Ok(st) = status().await else { return Ok(()) };
+    if !get_config().await?.is_complete() || !is_signed_in(&st) {
+        println!("Finish setting up with `gdrive setup`.");
+        return Ok(());
+    }
+    if mode_of(st.selected_folders, &Done::load()).is_none() {
+        println!("\nNew in this version: choose to mirror or stream your Drive.");
+        let args = SetupArgs::default();
+        choose_mode(ui, &args).await?;
+        if status().await?.selected_folders == Some(0) {
+            println!("  Choose the folders to stream with `gdrive folders browse`.");
         }
-    };
-    let summary = match &choice {
-        None => "your whole Drive".to_owned(),
-        Some(f) if f.is_empty() => "no folders for now".to_owned(),
-        Some(f) => f.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
-    };
-    ipc::call(&Request::SetFolders { folders: choice }).await?;
-    println!("  ✓ Syncing {summary}");
+    }
     Ok(())
 }
 
@@ -808,6 +904,18 @@ mod tests {
         assert!(drive_error_hint("network unavailable", None).is_none());
         assert!(sign_in_hint("Sign-in failed: sign-in was cancelled: access_denied", None).unwrap().contains("Testing"));
         assert!(sign_in_hint("token endpoint: invalid_client Unauthorized", None).unwrap().contains("--client-json"));
+    }
+
+    #[test]
+    fn the_mode_question_is_asked_once() {
+        let none = Done::default();
+        let asked = Done { steps: vec![MODE_STEP.into()] };
+        // Configs from before streaming mirror the whole Drive: settled.
+        assert!(mode_of(None, &none) == Some(Mode::Mirror));
+        assert!(mode_of(Some(2), &none) == Some(Mode::Stream));
+        // Nothing chosen yet: a fresh setup, unless streaming was the answer.
+        assert!(mode_of(Some(0), &none).is_none());
+        assert!(mode_of(Some(0), &asked) == Some(Mode::Stream));
     }
 
     #[test]

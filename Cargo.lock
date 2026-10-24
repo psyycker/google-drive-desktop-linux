@@ -1537,6 +1537,7 @@ dependencies = [
  "crossterm",
  "gdrive-core",
  "libc",
+ "serde",
  "serde_json",
  "tokio",
 ]

@@ -146,7 +146,15 @@ pub async fn run(check_only: bool, yes: bool) -> Result<()> {
             println!("  Quit and reopen the Google Drive app to use the new version of the window.");
         }
     }
-    restart_stale_daemon(&latest).await
+    restart_stale_daemon(&latest).await?;
+    // Only the new version knows which setup steps it added.
+    let mut setup = Command::new(&exe);
+    setup.args(["setup", "--after-update"]);
+    if yes {
+        setup.arg("--yes");
+    }
+    let _ = setup.status();
+    Ok(())
 }
 
 fn confirm(question: &str) -> Result<bool> {
