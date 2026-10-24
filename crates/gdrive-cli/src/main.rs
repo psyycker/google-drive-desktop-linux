@@ -1,5 +1,6 @@
 //! `gdrive` — command-line control for the gdrive-linux daemon.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -9,6 +10,7 @@ use gdrive_core::gdoc;
 use gdrive_core::ipc::{self, Coverage, Request, Response};
 use gdrive_core::status::{human_bytes, Direction, SyncState, UpdatePhase};
 
+mod picker;
 mod setup;
 mod update;
 
@@ -106,11 +108,14 @@ enum ConfigCmd {
 
 #[derive(Subcommand)]
 enum FoldersCmd {
-    /// List the folders on Drive inside a folder (the Drive root by default) and
-    /// whether they are synced.
+    /// Choose folders in your Drive with the arrow keys and Space. Given a folder, or
+    /// with --list, or outside a terminal: list the folders in it and whether they sync.
     Browse {
         /// A path from the Drive root, like `Work/Reports`, or a local path inside the Drive folder.
         folder: Option<PathBuf>,
+        /// Print the list instead of opening the picker.
+        #[arg(long)]
+        list: bool,
     },
     /// Start syncing these folders, with everything in them.
     Add {
@@ -282,8 +287,8 @@ async fn folders(action: Option<FoldersCmd>) -> Result<()> {
         None => match get_folders().await? {
             None => println!("Syncing the whole Drive. To sync only some folders: `gdrive folders only <folder>…`"),
             Some(sel) if sel.is_empty() => {
-                println!("No folders are synced yet. See what's on Drive with `gdrive folders browse`,");
-                println!("then pick folders with `gdrive folders add <folder>…`.");
+                println!("No folders are synced yet. Choose some with `gdrive folders browse`,");
+                println!("or `gdrive folders add <folder>…`.");
             }
             Some(sel) => {
                 println!("Syncing these Drive folders:");
@@ -292,7 +297,16 @@ async fn folders(action: Option<FoldersCmd>) -> Result<()> {
                 }
             }
         },
-        Some(FoldersCmd::Browse { folder }) => {
+        Some(FoldersCmd::Browse { folder: None, list: false })
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() =>
+        {
+            match picker::pick(get_folders().await?).await? {
+                Some(choice) if choice == get_folders().await? => println!("No changes."),
+                Some(choice) => set_folders(choice).await?,
+                None => println!("Cancelled; nothing changed."),
+            }
+        }
+        Some(FoldersCmd::Browse { folder, .. }) => {
             let path = match folder {
                 Some(f) => drive_paths(vec![f]).await?.remove(0),
                 None => PathBuf::new(),

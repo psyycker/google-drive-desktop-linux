@@ -12,7 +12,6 @@ use clap::Args;
 use gdrive_core::config::Config;
 use gdrive_core::ipc::{self, Request, Response};
 use gdrive_core::status::{Status, SyncState};
-use tokio::sync::mpsc;
 
 #[derive(Args, Default)]
 pub struct SetupArgs {
@@ -43,27 +42,36 @@ pub struct SetupArgs {
 const STEPS: usize = 6;
 const CLIENT_ID_SUFFIX: &str = ".apps.googleusercontent.com";
 
-/// Questions and answers. Standard input is read on one thread for the whole run, so a
-/// question asked while waiting for something else (the browser sign-in) doesn't leave
-/// a pending read that would swallow the next answer.
+/// Questions and answers. Standard input is only read when an answer is wanted (never
+/// in the background), so the folder picker can take over the keyboard.
 struct Ui {
-    lines: mpsc::UnboundedReceiver<String>,
     interactive: bool,
     yes: bool,
 }
 
+fn read_line() -> Result<String> {
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        bail!("no more input");
+    }
+    Ok(line.trim().to_owned())
+}
+
+/// A line typed within `timeout`, if any. In a terminal's line mode, input becomes
+/// readable only once Enter is pressed, so this never stops halfway through a line.
+fn line_within(timeout: Duration) -> Result<Option<String>> {
+    let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd, and its count.
+    let ready = unsafe { libc::poll(&mut fd, 1, timeout.as_millis() as libc::c_int) };
+    if ready <= 0 {
+        return Ok(None);
+    }
+    read_line().map(Some)
+}
+
 impl Ui {
     fn new(yes: bool) -> Self {
-        let (tx, lines) = mpsc::unbounded_channel();
-        std::thread::spawn(move || {
-            for line in std::io::stdin().lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        Self { lines, interactive: std::io::stdin().is_terminal(), yes }
+        Self { interactive: std::io::stdin().is_terminal(), yes }
     }
 
     fn step(&self, n: usize, title: &str) {
@@ -77,8 +85,7 @@ impl Ui {
         }
         print!("  {question} ");
         std::io::stdout().flush()?;
-        let line = self.lines.recv().await.ok_or_else(|| anyhow!("no more input"))?;
-        Ok(Some(line.trim().to_owned()))
+        Ok(Some(tokio::task::spawn_blocking(read_line).await??))
     }
 
     /// A yes/no question; Enter (and `--yes`) gives `default`.
@@ -573,7 +580,7 @@ fn sign_in_hint(message: &str, project: Option<&str>) -> Option<String> {
 }
 
 /// One sign-in attempt; Err carries the daemon's reason.
-async fn sign_in_once(ui: &mut Ui) -> Result<std::result::Result<(), String>> {
+async fn sign_in_once() -> Result<std::result::Result<(), String>> {
     let Response::LoginUrl { url } = ipc::call(&Request::StartLogin).await? else { bail!("unexpected reply") };
     let remote = std::env::var_os("SSH_CONNECTION").is_some();
     println!("  Open this address in a browser{}:", if remote { "" } else { " (it may have opened already)" });
@@ -588,14 +595,10 @@ async fn sign_in_once(ui: &mut Ui) -> Result<std::result::Result<(), String>> {
     print!("  > ");
     std::io::stdout().flush()?;
 
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
-        tokio::select! {
-            line = ui.lines.recv() => {
-                let line = line.ok_or_else(|| anyhow!("no more input"))?;
-                if line.trim().is_empty() {
-                    continue;
-                }
+        // Waits up to a second for a pasted address, then looks at the sign-in.
+        if let Some(line) = tokio::task::spawn_blocking(|| line_within(Duration::from_secs(1))).await?? {
+            if !line.is_empty() {
                 match tokio::task::spawn_blocking(move || deliver_redirect(&line)).await? {
                     Ok(()) => println!("  Finishing sign-in…"),
                     Err(e) => {
@@ -605,21 +608,19 @@ async fn sign_in_once(ui: &mut Ui) -> Result<std::result::Result<(), String>> {
                     }
                 }
             }
-            _ = tick.tick() => {
-                let st = status().await?;
-                match st.state {
-                    SyncState::SigningIn => {}
-                    SyncState::SignedOut | SyncState::SetupRequired => {
-                        println!();
-                        return Ok(Err(st.message.unwrap_or_else(|| "sign-in didn't finish".into())));
-                    }
-                    _ => {
-                        println!();
-                        let who = match st.account { Some(a) => format!(" as {}", a.email), None => String::new() };
-                        println!("  ✓ Signed in{who}");
-                        return Ok(Ok(()));
-                    }
-                }
+        }
+        let st = status().await?;
+        match st.state {
+            SyncState::SigningIn => {}
+            SyncState::SignedOut | SyncState::SetupRequired => {
+                println!();
+                return Ok(Err(st.message.unwrap_or_else(|| "sign-in didn't finish".into())));
+            }
+            _ => {
+                println!();
+                let who = match st.account { Some(a) => format!(" as {}", a.email), None => String::new() };
+                println!("  ✓ Signed in{who}");
+                return Ok(Ok(()));
             }
         }
     }
@@ -639,7 +640,7 @@ async fn sign_in(ui: &mut Ui) -> Result<()> {
     }
     let client_id = get_config().await?.client_id;
     loop {
-        let Err(reason) = sign_in_once(ui).await? else { return Ok(()) };
+        let Err(reason) = sign_in_once().await? else { return Ok(()) };
         println!("  Sign-in failed: {}", reason.trim_start_matches("Sign-in failed: "));
         if let Some(hint) = sign_in_hint(&reason, project_of(&client_id)) {
             println!("  {hint}");
@@ -744,14 +745,23 @@ async fn choose_folders(ui: &mut Ui, args: &SetupArgs) -> Result<()> {
             return Ok(());
         }
     }
-    let top = list(Path::new("")).await?;
     let choice = match flagged {
         Some(choice) => choice,
-        None if !ui.interactive || ui.yes => {
-            println!("  No folders chosen yet: pick some later with `gdrive folders add <folder>`.");
+        None if !ui.interactive || ui.yes || !std::io::stdout().is_terminal() => {
+            println!("  No folders chosen yet: pick some later with `gdrive folders browse`.");
             return Ok(());
         }
-        None => pick_folders(ui, top).await?,
+        None => {
+            let Response::Folders { folders } = ipc::call(&Request::GetFolders).await? else { bail!("unexpected reply") };
+            let saved = folders.map(|sel| sel.into_iter().map(|f| f.path).collect());
+            match crate::picker::pick(saved).await? {
+                Some(choice) => choice,
+                None => {
+                    println!("  Left as it was; choose later with `gdrive folders browse`.");
+                    return Ok(());
+                }
+            }
+        }
     };
     let summary = match &choice {
         None => "your whole Drive".to_owned(),
@@ -761,83 +771,6 @@ async fn choose_folders(ui: &mut Ui, args: &SetupArgs) -> Result<()> {
     ipc::call(&Request::SetFolders { folders: choice }).await?;
     println!("  ✓ Syncing {summary}");
     Ok(())
-}
-
-/// A small folder browser: numbers or paths choose, `N/` looks inside, `..` goes back.
-/// Returns `None` for the whole Drive.
-async fn pick_folders(ui: &mut Ui, top: Vec<PathBuf>) -> Result<Option<Vec<PathBuf>>> {
-    let mut chosen: Vec<PathBuf> = Vec::new();
-    let mut here = PathBuf::new();
-    let mut shown = top;
-    println!("  Choose what to keep on this computer; everything stays on Drive either way.");
-    println!("  Type numbers or paths (e.g. `2 Work/Reports`) to choose, `2/` to look inside a folder,");
-    println!("  `..` to go back, `all` for your whole Drive. Press Enter when done.");
-    loop {
-        let place = if here.as_os_str().is_empty() { "your Drive".to_owned() } else { here.display().to_string() };
-        if shown.is_empty() {
-            println!("\n  No folders in {place}.");
-        } else {
-            println!("\n  Folders in {place}:");
-            for (i, f) in shown.iter().enumerate() {
-                let mark = if chosen.iter().any(|c| f.starts_with(c)) { "x" } else { " " };
-                println!("   [{mark}] {:>2}. {}", i + 1, f.file_name().unwrap_or_default().to_string_lossy());
-            }
-        }
-        if !chosen.is_empty() {
-            let names: Vec<String> = chosen.iter().map(|c| c.display().to_string()).collect();
-            println!("  Chosen: {}", names.join(", "));
-        }
-        let answer = ui.ask(">").await?.unwrap_or_default();
-        match answer.as_str() {
-            "" if chosen.is_empty() => {
-                if ui.confirm("Nothing chosen. Leave it for later?", true).await? {
-                    return Ok(Some(chosen));
-                }
-                continue;
-            }
-            "" => return Ok(Some(chosen)),
-            "all" => return Ok(None),
-            ".." => {
-                here.pop();
-                shown = list(&here).await?;
-                continue;
-            }
-            _ => {}
-        }
-        for token in answer.split_whitespace() {
-            let (number, inside) = match token.strip_suffix('/') {
-                Some(n) => (n, true),
-                None => (token, false),
-            };
-            let target = match number.parse::<usize>() {
-                Ok(n) if (1..=shown.len()).contains(&n) => shown[n - 1].clone(),
-                Ok(_) => {
-                    println!("  There's no folder {number} here.");
-                    continue;
-                }
-                Err(_) => PathBuf::from(number.trim_matches('/')),
-            };
-            if inside {
-                match list(&target).await {
-                    Ok(sub) => {
-                        here = target;
-                        shown = sub;
-                    }
-                    Err(e) => println!("  {e:#}"),
-                }
-            } else if let Some(pos) = chosen.iter().position(|c| *c == target) {
-                chosen.remove(pos);
-            } else if let Some(parent) = chosen.iter().find(|c| target.starts_with(c)) {
-                println!("  {} is already included with {}.", target.display(), parent.display());
-            } else if let Err(e) = list(&target).await {
-                // Checks the folder exists before choosing it.
-                println!("  {e:#}");
-            } else {
-                chosen.retain(|c| !c.starts_with(&target));
-                chosen.push(target);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

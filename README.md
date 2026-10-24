@@ -78,8 +78,8 @@ A new setup syncs **nothing** until you pick folders; the whole Drive is still r
 (names only) so you can browse it:
 
 ```sh
-gdrive folders browse              # folders at the top of your Drive ([x] synced, [~] partly)
-gdrive folders browse Work         # …and inside Work
+gdrive folders browse              # pick folders: arrows to move and open, Space to tick, Enter to save
+gdrive folders browse Work         # list the folders inside Work ([x] synced, [~] partly; also --list)
 gdrive folders add Work/Reports Photos
 gdrive folders remove Photos       # local copy removed; it stays on Drive
 gdrive folders                     # what is synced
@@ -212,8 +212,8 @@ it is safe to run again:
    what to change in the console and tries again;
 5. checks that your Drive can actually be read, and if not (the Drive API is off,
    access to files wasn't allowed), says how to fix it and checks again;
-6. lists your Drive's folders to choose from (`2/` looks inside folder 2, `..` goes
-   back, `all` syncs the whole Drive).
+6. opens a folder picker: ↑/↓ to move, → to open a folder, ← to close it, Space to
+   tick it, `a` for the whole Drive, Enter to save.
 
 For scripted installs, flags answer the questions:
 `gdrive setup --client-json FILE --local-folder ~/Drive --sync Work --sync Photos --yes`
