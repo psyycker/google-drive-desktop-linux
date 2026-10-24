@@ -119,6 +119,14 @@ export interface Placement {
   location: string;
 }
 
+/** A Drive folder chosen for syncing. */
+export interface SelectedFolder {
+  /** Drive id; the choice follows the folder when it is renamed or moved. */
+  id: string;
+  /** Relative to the Drive root when last looked up, e.g. `Work/Reports`. */
+  path: string;
+}
+
 /** User configuration (`~/.config/gdrive-linux/config.toml`). */
 export interface Config {
   client_id: string;
@@ -136,4 +144,7 @@ export interface Config {
   locations: StorageLocation[];
   /** Changed only by moving folders (`relocateFolder`); the daemon ignores edits. */
   placements: Placement[];
+  /** The Drive folders synced; `null` syncs the whole Drive. Changed only through the
+   * daemon (`gdrive folders`); it ignores edits here. */
+  selected_folders: SelectedFolder[] | null;
 }

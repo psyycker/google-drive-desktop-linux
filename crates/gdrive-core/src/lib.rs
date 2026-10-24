@@ -21,5 +21,6 @@ pub mod layout;
 pub mod local;
 pub mod nautilus;
 pub mod relocate;
+pub mod selection;
 pub mod status;
 pub mod update;

@@ -10,16 +10,17 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use gdrive_core::auth::{self, Authenticator, Token};
 use gdrive_core::bandwidth::Bandwidth;
-use gdrive_core::config::{self, Config};
+use gdrive_core::config::{self, Config, SelectedFolder};
 use gdrive_core::db::Db;
 use gdrive_core::engine::{self, Command, EngineHandle};
-use gdrive_core::ipc::{Request, Response};
+use gdrive_core::ipc::{Coverage, FolderEntry, Request, Response};
 use gdrive_core::layout::Layout;
 use gdrive_core::local;
 use gdrive_core::relocate::{self, MoveProgress};
+use gdrive_core::selection::DriveFolders;
 use gdrive_core::status::{ActivityKind, Relocation, Status, SyncState};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -115,6 +116,12 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
             start_relocation(daemon, &mut d, folder, location).await?;
             Response::Ok
         }
+        Request::GetFolders => Response::Folders { folders: current_folders(&d)? },
+        Request::Browse { path } => browse(&d, path)?,
+        Request::SetFolders { folders } => {
+            set_folders(&mut d, folders).await?;
+            Response::Ok
+        }
         Request::Shutdown => {
             tracing::info!("shutdown requested");
             d.shutdown.notify_one();
@@ -188,14 +195,10 @@ async fn start_relocation(daemon: &Shared, d: &mut Daemon, folder: PathBuf, loca
             bail!("there is no storage location called \"{name}\"");
         }
     }
-    let folder = if folder.is_absolute() {
-        Layout::from_config(&d.config)
-            .rel(&folder)
-            .ok_or_else(|| anyhow::anyhow!("{} is not inside the Drive folder", folder.display()))?
-    } else {
-        folder
-    };
-    let folder = relocate::normalize(&folder)?;
+    let folder = relocate::normalize(&drive_rel(&d.config, folder)?)?;
+    if location.is_some() && !d.config.is_selected(&folder) {
+        bail!("{} isn't synced; add it with `gdrive folders add` first", folder.display());
+    }
 
     d.relocating = true;
     d.stop_engine().await;
@@ -263,6 +266,116 @@ async fn start_relocation(daemon: &Shared, d: &mut Daemon, folder: PathBuf, loca
     Ok(())
 }
 
+/// A folder given as an absolute local path or a Drive-relative one, as Drive-relative.
+fn drive_rel(config: &Config, path: PathBuf) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Ok(path);
+    }
+    Layout::from_config(config).rel(&path).ok_or_else(|| anyhow!("{} is not inside the Drive folder", path.display()))
+}
+
+/// Like [`drive_rel`], without `.` or trailing parts; `..` is refused. The Drive root
+/// itself is allowed only when `root_ok`.
+fn drive_folder(config: &Config, path: PathBuf, root_ok: bool) -> Result<PathBuf> {
+    let rel = drive_rel(config, path)?;
+    let mut out = PathBuf::new();
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(part) => out.push(part),
+            std::path::Component::CurDir => {}
+            _ => bail!("{} is not a folder inside the Drive", rel.display()),
+        }
+    }
+    if out.as_os_str().is_empty() && !root_ok {
+        bail!("pick a folder inside the Drive (to sync all of it, use `gdrive folders all`)");
+    }
+    Ok(out)
+}
+
+/// The selected folders with their current paths; `None` when the whole Drive syncs.
+fn current_folders(d: &Daemon) -> Result<Option<Vec<SelectedFolder>>> {
+    let Some(selected) = &d.config.selected_folders else { return Ok(None) };
+    let db = Db::open(&config::db_file())?;
+    match DriveFolders::new(&db) {
+        Ok(drive) => Ok(Some(drive.refresh(selected)?)),
+        // Not listed yet: the paths saved with the selection are all there is.
+        Err(_) => Ok(Some(selected.clone())),
+    }
+}
+
+fn browse(d: &Daemon, path: PathBuf) -> Result<Response> {
+    let rel = drive_folder(&d.config, path, true)?;
+    let selected = current_folders(d)?;
+    let db = Db::open(&config::db_file())?;
+    let drive = DriveFolders::new(&db)?;
+    let id = drive.resolve(&rel)?;
+    let folders = drive
+        .subfolders(&id)?
+        .into_iter()
+        .map(|f| {
+            let path = rel.join(local::sanitize_name(&f.name));
+            let coverage = match &selected {
+                None => Coverage::Whole,
+                Some(sel) if sel.iter().any(|s| path.starts_with(&s.path)) => Coverage::Whole,
+                Some(sel) if sel.iter().any(|s| s.path.starts_with(&path)) => Coverage::Partly,
+                Some(_) => Coverage::Unsynced,
+            };
+            FolderEntry { name: f.name, path, coverage }
+        })
+        .collect();
+    Ok(Response::Listing { folders })
+}
+
+/// Changes which Drive folders are synced and restarts the engine, which downloads the
+/// newly selected ones and removes local copies of the rest.
+async fn set_folders(d: &mut Daemon, folders: Option<Vec<PathBuf>>) -> Result<()> {
+    if d.relocating {
+        bail!("a folder is being moved; wait for it to finish");
+    }
+    let mut new = d.config.clone();
+    new.selected_folders = match folders {
+        None => None,
+        Some(paths) => {
+            let current = current_folders(d)?.unwrap_or_default();
+            let db = Db::open(&config::db_file())?;
+            let drive = DriveFolders::new(&db);
+            let mut next: Vec<SelectedFolder> = Vec::new();
+            for path in paths {
+                let rel = drive_folder(&d.config, path, false)?;
+                let folder = match current.iter().find(|f| f.path == rel) {
+                    Some(f) => f.clone(),
+                    None => {
+                        let drive = drive.as_ref().map_err(|e| anyhow!("{e:#}"))?;
+                        SelectedFolder { id: drive.resolve(&rel)?, path: rel }
+                    }
+                };
+                if !next.iter().any(|f| f.id == folder.id) {
+                    next.push(folder);
+                }
+            }
+            Some(next)
+        }
+    };
+    if let Some(p) = new.placements.iter().find(|p| !new.is_selected(&p.folder)) {
+        bail!(
+            "{0} is kept on \"{1}\"; move it back first with `gdrive move \"{0}\" main`",
+            p.folder.display(),
+            p.location
+        );
+    }
+    if new == d.config {
+        return Ok(());
+    }
+    new.save()?;
+    d.stop_engine().await;
+    d.config = new;
+    match &d.config.selected_folders {
+        None => tracing::info!("syncing the whole Drive"),
+        Some(sel) => tracing::info!("syncing {} selected folder(s)", sel.len()),
+    }
+    d.start_engine()
+}
+
 /// Wipes the sync folder and the sync state, then restarts the engine, which sees an
 /// empty folder and a never-synced Drive and downloads everything again.
 async fn redownload(d: &mut Daemon) -> Result<()> {
@@ -316,8 +429,10 @@ async fn apply_config(d: &mut Daemon, mut new: Config) -> Result<()> {
             *limit = 0.0;
         }
     }
-    // Placements only change by moving files (Relocate), never through settings.
+    // Placements only change by moving files (Relocate), and the selection through
+    // SetFolders, never through settings.
     new.placements = d.config.placements.clone();
+    new.selected_folders = d.config.selected_folders.clone();
     for loc in &mut new.locations {
         loc.name = loc.name.trim().to_owned();
     }

@@ -101,5 +101,7 @@ export function configFromForm(form: SettingsForm, base: Config | null): Config 
       .filter(Boolean),
     locations: checkLocations(form.locations),
     placements: base?.placements ?? [],
+    // A config saved before folder selection existed has none: it syncs everything.
+    selected_folders: base ? (base.selected_folders ?? null) : [],
   };
 }

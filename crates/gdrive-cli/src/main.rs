@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use gdrive_core::config::{Config, StorageLocation};
 use gdrive_core::gdoc;
-use gdrive_core::ipc::{self, Request, Response};
+use gdrive_core::ipc::{self, Coverage, Request, Response};
 use gdrive_core::status::{human_bytes, Direction, SyncState, UpdatePhase};
 
 #[derive(Parser)]
@@ -50,6 +50,11 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<ConfigCmd>,
     },
+    /// Choose which Drive folders are synced (new setups start with none).
+    Folders {
+        #[command(subcommand)]
+        action: Option<FoldersCmd>,
+    },
     /// Open a .gdoc/.gsheet/… link file in the browser.
     Open { file: PathBuf },
     /// Move a Drive folder to another drive (see `gdrive config location`), or back.
@@ -83,6 +88,40 @@ enum ConfigCmd {
         #[command(subcommand)]
         action: LocationCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum FoldersCmd {
+    /// List the folders on Drive inside a folder (the Drive root by default) and
+    /// whether they are synced.
+    Browse {
+        /// A path from the Drive root, like `Work/Reports`, or a local path inside the Drive folder.
+        folder: Option<PathBuf>,
+    },
+    /// Start syncing these folders, with everything in them.
+    Add {
+        /// Paths from the Drive root, like `Work/Reports`, or local paths inside the Drive folder.
+        #[arg(required = true)]
+        folders: Vec<PathBuf>,
+    },
+    /// Stop syncing these folders. Their local copies are removed; they stay on Drive.
+    Remove {
+        /// Paths from the Drive root, like `Work/Reports`, or local paths inside the Drive folder.
+        #[arg(required = true)]
+        folders: Vec<PathBuf>,
+    },
+    /// Sync only these folders, replacing the current choice.
+    Only {
+        /// Paths from the Drive root, like `Work/Reports`, or local paths inside the Drive folder.
+        #[arg(required = true)]
+        folders: Vec<PathBuf>,
+        /// Confirm, when the whole Drive is synced now, that local copies of
+        /// everything else may be removed.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Sync the whole Drive.
+    All,
 }
 
 #[derive(Subcommand)]
@@ -123,6 +162,14 @@ async fn status(recent: usize) -> Result<()> {
         }
     }
     println!("Folder:   {}", st.sync_root);
+    // An older daemon doesn't know about folder selection; just leave the line out.
+    if let Ok(Response::Folders { folders }) = ipc::call(&Request::GetFolders).await {
+        match folders.as_deref() {
+            None => println!("Syncing:  the whole Drive"),
+            Some([]) => println!("Syncing:  no folders yet (pick some: `gdrive folders browse`, `gdrive folders add <folder>`)"),
+            Some(sel) => println!("Syncing:  {} selected folder(s) (`gdrive folders` lists them)", sel.len()),
+        }
+    }
     if !st.version.is_empty() {
         println!("Version:  {}", st.version);
     }
@@ -183,6 +230,126 @@ async fn update_config(f: impl FnOnce(&mut Config)) -> Result<()> {
     Ok(())
 }
 
+/// The selected folders' paths, or `None` when the whole Drive is synced.
+async fn get_folders() -> Result<Option<Vec<PathBuf>>> {
+    let Response::Folders { folders } = ipc::call(&Request::GetFolders).await? else { bail!("unexpected reply") };
+    Ok(folders.map(|sel| sel.into_iter().map(|f| f.path).collect()))
+}
+
+async fn set_folders(folders: Option<Vec<PathBuf>>) -> Result<()> {
+    let what = match &folders {
+        None => "the whole Drive".to_owned(),
+        Some(f) if f.is_empty() => "no folders".to_owned(),
+        Some(f) => format!("{} folder(s)", f.len()),
+    };
+    ipc::call(&Request::SetFolders { folders }).await?;
+    println!("Now syncing {what}; follow along with `gdrive status`.");
+    Ok(())
+}
+
+/// Folder arguments as paths from the Drive root: a local path inside the Drive folder
+/// is converted, anything else is taken as a Drive path already.
+async fn drive_paths(folders: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    let Response::Config { config } = ipc::call(&Request::GetConfig).await? else { bail!("unexpected reply") };
+    folders
+        .into_iter()
+        .map(|f| {
+            let abs = std::path::absolute(&f)?;
+            let rel = match abs.strip_prefix(&config.sync_root) {
+                Ok(rel) if abs.exists() => rel.to_path_buf(),
+                _ => f,
+            };
+            // Same spelling as the daemon reports, so they compare equal.
+            Ok(rel.components().filter(|c| !matches!(c, std::path::Component::CurDir)).collect())
+        })
+        .collect()
+}
+
+async fn folders(action: Option<FoldersCmd>) -> Result<()> {
+    let whole_drive = "the whole Drive is synced; to sync only some folders, run `gdrive folders only <folder>…`";
+    match action {
+        None => match get_folders().await? {
+            None => println!("Syncing the whole Drive. To sync only some folders: `gdrive folders only <folder>…`"),
+            Some(sel) if sel.is_empty() => {
+                println!("No folders are synced yet. See what's on Drive with `gdrive folders browse`,");
+                println!("then pick folders with `gdrive folders add <folder>…`.");
+            }
+            Some(sel) => {
+                println!("Syncing these Drive folders:");
+                for f in sel {
+                    println!("  {}", f.display());
+                }
+            }
+        },
+        Some(FoldersCmd::Browse { folder }) => {
+            let path = match folder {
+                Some(f) => drive_paths(vec![f]).await?.remove(0),
+                None => PathBuf::new(),
+            };
+            let Response::Listing { folders } = ipc::call(&Request::Browse { path: path.clone() }).await? else {
+                bail!("unexpected reply")
+            };
+            let place = if path.as_os_str().is_empty() { "your Drive".to_owned() } else { path.display().to_string() };
+            if folders.is_empty() {
+                println!("No folders in {place}.");
+                return Ok(());
+            }
+            println!("Folders in {place}  ([x] synced, [~] partly synced):");
+            for f in folders {
+                let mark = match f.coverage {
+                    Coverage::Whole => "[x]",
+                    Coverage::Partly => "[~]",
+                    Coverage::Unsynced => "[ ]",
+                };
+                println!("  {mark} {}", f.path.display());
+            }
+        }
+        Some(FoldersCmd::Add { folders }) => {
+            let Some(mut sel) = get_folders().await? else { bail!(whole_drive) };
+            for f in drive_paths(folders).await? {
+                if let Some(parent) = sel.iter().find(|s| f.starts_with(s)) {
+                    println!("{} is already synced (as part of {}).", f.display(), parent.display());
+                    continue;
+                }
+                // Folders inside it come along anyway.
+                sel.retain(|s| !s.starts_with(&f));
+                sel.push(f);
+            }
+            set_folders(Some(sel)).await?
+        }
+        Some(FoldersCmd::Remove { folders }) => {
+            let Some(mut sel) = get_folders().await? else { bail!(whole_drive) };
+            for f in drive_paths(folders).await? {
+                if let Some(pos) = sel.iter().position(|s| *s == f) {
+                    sel.remove(pos);
+                } else if let Some(parent) = sel.iter().find(|s| f.starts_with(s)) {
+                    bail!(
+                        "{} is synced as part of {}; only whole selected folders can be removed. \
+                         Remove {} and add the folders inside it that you want instead.",
+                        f.display(),
+                        parent.display(),
+                        parent.display()
+                    );
+                } else {
+                    bail!("{} isn't synced", f.display());
+                }
+            }
+            set_folders(Some(sel)).await?
+        }
+        Some(FoldersCmd::Only { folders, yes }) => {
+            if get_folders().await?.is_none() && !yes {
+                bail!(
+                    "the whole Drive is synced now: this removes the local copies of everything else \
+                     (it stays on Drive). Run again with --yes to confirm."
+                );
+            }
+            set_folders(Some(drive_paths(folders).await?)).await?
+        }
+        Some(FoldersCmd::All) => set_folders(None).await?,
+    }
+    Ok(())
+}
+
 fn open_link(file: &Path) -> Result<()> {
     let link = gdoc::read(file).with_context(|| format!("{} is not a Google Drive link file", file.display()))?;
     std::process::Command::new("xdg-open").arg(&link.url).spawn()?.wait()?;
@@ -212,6 +379,9 @@ async fn main() -> Result<()> {
         Cmd::Login => {
             if let Response::LoginUrl { url } = ipc::call(&Request::StartLogin).await? {
                 println!("Opening your browser to sign in. If it didn't open, visit:\n\n  {url}\n");
+                println!("Signing in from a browser on another computer (e.g. over SSH)? After you allow access,");
+                println!("it fails to load a http://127.0.0.1:… page. Copy that page's address and run, on this computer:");
+                println!("  curl '<address>'\n");
                 println!("Run `gdrive status` to follow progress.");
             }
         }
@@ -256,6 +426,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Cmd::Open { file } => open_link(&file)?,
+        Cmd::Folders { action } => folders(action).await?,
         Cmd::Config { action: Some(ConfigCmd::Location { action }) } => match action {
             LocationCmd::Add { name, path } => {
                 let root = std::path::absolute(path)?;

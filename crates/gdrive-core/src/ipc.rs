@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, SelectedFolder};
 use crate::status::Status;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +42,34 @@ pub enum Request {
     /// `location` is `None`. `folder` is Drive-relative or an absolute local path.
     /// Returns at once; progress shows in `Status::relocation`.
     Relocate { folder: PathBuf, location: Option<String> },
+    /// The Drive folders chosen for syncing, with up-to-date paths. Returns `Folders`.
+    GetFolders,
+    /// The folders directly inside a Drive folder (`""` for the root), whether or not
+    /// they are synced. `path` is Drive-relative or an absolute local path. Returns
+    /// `Listing`.
+    Browse { path: PathBuf },
+    /// Sync only these Drive folders (Drive-relative or absolute local paths), or the
+    /// whole Drive when `None`. Local copies of whatever is left out are removed.
+    SetFolders { folders: Option<Vec<PathBuf>> },
+}
+
+/// How much of a Drive folder is synced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    /// It is selected, or inside a selected folder.
+    Whole,
+    /// Some folder inside it is selected.
+    Partly,
+    Unsynced,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderEntry {
+    pub name: String,
+    /// Drive-relative.
+    pub path: PathBuf,
+    pub coverage: Coverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +92,9 @@ pub enum Response {
         /// Names of all storage locations.
         locations: Vec<String>,
     },
+    /// `None`: the whole Drive is synced.
+    Folders { folders: Option<Vec<SelectedFolder>> },
+    Listing { folders: Vec<FolderEntry> },
     Error { message: String },
 }
 

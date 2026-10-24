@@ -657,6 +657,7 @@ impl Harness {
             poll_interval_secs: 1,
             use_local_trash: false,
             max_concurrent_transfers: 3,
+            selected_folders: None,
             ..Config::default()
         }
     }

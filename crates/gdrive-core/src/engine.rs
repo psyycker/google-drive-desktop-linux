@@ -202,6 +202,10 @@ impl Shared {
 struct Engine {
     shared: Arc<Shared>,
     ignore: IgnoreRules,
+    /// Ids of the selected Drive folders, or `None` to sync the whole Drive.
+    selected: Option<HashSet<String>>,
+    /// Where the selected folders are (Drive-relative): see `refresh_scope`.
+    scope: Option<Vec<PathBuf>>,
     poll_interval: Duration,
     semaphore: Arc<Semaphore>,
     cancel: CancellationToken,
@@ -268,6 +272,9 @@ impl Engine {
                 use_trash: config.use_local_trash,
             }),
             ignore: IgnoreRules::new(&config.ignore),
+            selected: config.selected_folders.as_ref().map(|f| f.iter().map(|f| f.id.clone()).collect()),
+            // Nothing is in scope until the selected folders are looked up.
+            scope: config.selected_folders.as_ref().map(|_| Vec::new()),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_transfers.clamp(1, 16))),
             cancel,
@@ -880,6 +887,39 @@ impl Engine {
         Ok(Some((item, path)))
     }
 
+    /// Looks up where the selected folders are, both where Drive has them now and
+    /// where they were last synced: while one is being renamed or moved, both of its
+    /// paths count as selected.
+    fn refresh_scope(&mut self) -> Result<()> {
+        let Some(selected) = &self.selected else { return Ok(()) };
+        let mut paths = Vec::new();
+        {
+            let db = self.db();
+            for id in selected {
+                if let Some((r, path)) = self.remote_path_in(&*db, id)? {
+                    if r.is_dir() {
+                        paths.push(path);
+                    }
+                }
+                if let Some(s) = db.get_synced(id)?.filter(|s| s.is_dir) {
+                    paths.push(s.rel_path);
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        self.scope = Some(paths);
+        Ok(())
+    }
+
+    /// Whether a Drive-relative path is in the synced part of the Drive: inside a
+    /// selected folder, or a folder on the way to one.
+    fn in_scope(&self, rel: &Path, is_dir: bool) -> bool {
+        self.scope
+            .as_ref()
+            .is_none_or(|folders| folders.iter().any(|f| rel.starts_with(f) || (is_dir && f.starts_with(rel))))
+    }
+
     /// Drive id of the folder that a local relative path's parent maps to.
     fn parent_id_for(&self, db: &Db, rel: &Path) -> Result<Option<String>> {
         match rel.parent() {
@@ -904,19 +944,25 @@ impl Engine {
     fn scan_for_changes(&mut self) -> Result<()> {
         self.last_full_scan = Instant::now();
         let started = std::time::Instant::now();
+        self.refresh_scope()?;
         let (synced, remote) = {
             let db = self.db();
             (db.all_synced()?, db.remote_snapshot()?)
         };
         let mut remote_paths = HashMap::new();
         for id in remote.ids() {
-            if let Some((_, path)) = self.remote_path_in(&remote, id)? {
-                remote_paths.insert(id, path);
+            if let Some((r, path)) = self.remote_path_in(&remote, id)? {
+                if self.in_scope(&path, r.is_dir()) {
+                    remote_paths.insert(id, path);
+                }
             }
         }
 
         // Local side: unknown paths are new (or renamed); known ones are compared by stat.
         let by_path: HashMap<&Path, &SyncedItem> = synced.iter().map(|s| (s.rel_path.as_path(), s)).collect();
+        // Outside the selected folders, an unknown path matters only as where a synced
+        // item was moved to.
+        let synced_inodes: HashSet<u64> = synced.iter().map(|s| s.inode).collect();
         let mut unchanged_locally = HashSet::new();
         let mut new_paths = 0;
         let layout = self.shared.layout.clone();
@@ -941,6 +987,7 @@ impl Engine {
                 continue; // symlinks and special files are never synced
             };
             match by_path.get(rel.as_path()) {
+                None if !self.in_scope(&rel, l.is_dir) && !synced_inodes.contains(&l.inode) => {}
                 None => {
                     self.dirty_paths.insert(rel);
                     new_paths += 1;
@@ -998,6 +1045,7 @@ impl Engine {
 
     async fn reconcile(&mut self) -> Result<()> {
         self.check_root(false).inspect_err(|e| self.fatal = Some(e.to_string()))?;
+        self.refresh_scope()?;
 
         let now = Instant::now();
         let due: Vec<Work> = self.retry.iter().filter(|(_, r)| r.due <= now).map(|(w, _)| w.clone()).collect();
@@ -1125,6 +1173,12 @@ impl Engine {
         }
         let synced = self.db().get_synced(id)?;
         let remote = self.remote_path(id)?;
+        if remote.as_ref().is_some_and(|(r, path)| !self.in_scope(path, r.is_dir())) {
+            return match synced {
+                Some(s) => self.deselected(s),
+                None => Ok(Outcome::Done),
+            };
+        }
         match (synced, remote) {
             (None, None) => Ok(Outcome::Done),
             (None, Some((r, path))) => self.remote_new(r, path).await,
@@ -1263,6 +1317,52 @@ impl Engine {
                 Some("deleted on Drive but changed on this computer; uploading it again".into()),
             );
             self.dirty_paths.insert(s.rel_path);
+        }
+        Ok(Outcome::Done)
+    }
+
+    /// A synced item that is outside the selected folders now (unselected, or moved out
+    /// of them on Drive). Its local copy is removed and Drive keeps it; local changes
+    /// that were never uploaded stay where they are, no longer synced.
+    fn deselected(&mut self, s: SyncedItem) -> Result<Outcome> {
+        if self.inflight_under(&s.rel_path) {
+            return Ok(Outcome::Defer);
+        }
+        let abs = self.layout().abs(&s.rel_path);
+        let local = local::stat(&abs);
+        let clean = match &local {
+            None => true,
+            Some(l) if l.is_dir != s.is_dir => false,
+            Some(_) if s.is_dir => self.subtree_clean(&s.rel_path)?,
+            Some(l) => l.size == s.size && l.mtime_ns == s.mtime_ns,
+        };
+        if !clean {
+            self.db().delete_synced(&s.id)?;
+            if s.is_dir {
+                // Remove what can be removed inside it; the changed files stay.
+                let inside = self.db().synced_descendants(&s.rel_path)?;
+                self.dirty_ids.extend(inside.into_iter().map(|c| c.id));
+            } else {
+                self.shared.activity(
+                    ActivityKind::Conflict,
+                    &s.rel_path,
+                    Some("no longer synced, but changed on this computer; left in place".into()),
+                );
+            }
+            return Ok(Outcome::Done);
+        }
+        if s.is_dir {
+            self.db().delete_synced_subtree(&s.rel_path)?;
+        } else {
+            self.db().delete_synced(&s.id)?;
+        }
+        if local.is_some() {
+            // Drive has the same content, so there is nothing to keep in the trash.
+            local::remove_any(&abs)?;
+            if self.layout().is_placed_folder(&s.rel_path) {
+                let _ = local::remove_placeholder(&self.layout().main().join(&s.rel_path));
+            }
+            self.shared.activity(ActivityKind::DeletedLocal, &s.rel_path, Some("no longer synced; still on Drive".into()));
         }
         Ok(Outcome::Done)
     }
@@ -1492,6 +1592,16 @@ impl Engine {
             db.move_synced_subtree(&s.rel_path, rel)?;
         }
         self.shared.activity(ActivityKind::MovedRemote, rel, Some(format!("from {}", rel_str(&s.rel_path))));
+        self.refresh_scope()?;
+        if !self.in_scope(rel, s.is_dir) {
+            // Moved out of the selected folders: Drive moved it too, and it stays here,
+            // no longer synced (rather than being removed as unselected).
+            if s.is_dir {
+                self.db().delete_synced_subtree(rel)?;
+            } else {
+                self.db().delete_synced(&s.id)?;
+            }
+        }
         Ok(Some(s.id))
     }
 
@@ -1502,6 +1612,10 @@ impl Engine {
         }
         let abs = self.layout().abs(rel);
         let Some(l) = local::stat(&abs) else { return Ok(Outcome::Done) };
+        if !self.in_scope(rel, l.is_dir) {
+            tracing::debug!("{} is outside the selected folders; not uploading it", rel.display());
+            return Ok(Outcome::Done);
+        }
         enum Next {
             Synced(String),
             AdoptRemote(String),

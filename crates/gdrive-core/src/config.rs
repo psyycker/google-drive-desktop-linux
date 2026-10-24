@@ -11,7 +11,7 @@ pub struct Config {
     pub client_id: String,
     /// OAuth client secret of the same credential (not actually secret for desktop apps).
     pub client_secret: String,
-    /// Local folder that mirrors the whole of My Drive.
+    /// Local folder that mirrors My Drive, or the selected folders of it.
     pub sync_root: PathBuf,
     /// How often to poll the Drive Changes API, in seconds.
     pub poll_interval_secs: u64,
@@ -33,6 +33,21 @@ pub struct Config {
     /// Drive folders kept on one of `locations` instead of under `sync_root`. Only the
     /// daemon changes these, as it moves the files.
     pub placements: Vec<Placement>,
+    /// The Drive folders to sync, each with everything in it; `None` syncs the whole
+    /// Drive. New setups start with none selected, while a config written before this
+    /// setting existed lacks it and keeps syncing everything. Only the daemon changes
+    /// these.
+    #[serde(default)]
+    pub selected_folders: Option<Vec<SelectedFolder>>,
+}
+
+/// A Drive folder chosen for syncing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectedFolder {
+    /// Drive id, so the choice follows the folder when it is renamed or moved.
+    pub id: String,
+    /// Path relative to the Drive root when it was last looked up, for display.
+    pub path: PathBuf,
 }
 
 /// A folder on another disk, e.g. an SSD, that mirrors part of the Drive.
@@ -67,6 +82,7 @@ impl Default for Config {
             auto_update: true,
             locations: Vec::new(),
             placements: Vec::new(),
+            selected_folders: Some(Vec::new()),
         }
     }
 }
@@ -74,6 +90,11 @@ impl Default for Config {
 impl Config {
     pub fn is_complete(&self) -> bool {
         !self.client_id.trim().is_empty() && !self.client_secret.trim().is_empty()
+    }
+
+    /// Whether `folder` (Drive-relative) is synced with everything in it.
+    pub fn is_selected(&self, folder: &Path) -> bool {
+        self.selected_folders.as_ref().is_none_or(|sel| sel.iter().any(|f| folder.starts_with(&f.path)))
     }
 
     pub fn location(&self, name: &str) -> Option<&StorageLocation> {
@@ -186,4 +207,35 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
 /// Whether one path is the other or inside it.
 pub fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_setups_select_nothing_but_old_configs_keep_the_whole_drive() {
+        assert_eq!(Config::default().selected_folders, Some(Vec::new()));
+        let old: Config = toml::from_str("client_id = \"x\"\nsync_root = \"/d\"\n").unwrap();
+        assert_eq!(old.selected_folders, None);
+    }
+
+    #[test]
+    fn selection_survives_a_save() {
+        let mut c = Config {
+            locations: vec![StorageLocation { name: "SSD".into(), root: "/ssd".into() }],
+            placements: vec![Placement { folder: "Work/Big".into(), location: "SSD".into() }],
+            ..Config::default()
+        };
+        for sel in [Some(Vec::new()), Some(vec![SelectedFolder { id: "abc".into(), path: "Work".into() }]), None] {
+            c.selected_folders = sel;
+            let back: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+            assert_eq!(back, c);
+        }
+        assert!(Config { selected_folders: None, ..c.clone() }.is_selected(Path::new("Anything")));
+        c.selected_folders = Some(vec![SelectedFolder { id: "abc".into(), path: "Work".into() }]);
+        assert!(c.is_selected(Path::new("Work/Big")));
+        assert!(!c.is_selected(Path::new("Workshop")));
+        assert!(!c.is_selected(Path::new("Other")));
+    }
 }

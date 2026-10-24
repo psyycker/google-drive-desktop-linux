@@ -7,8 +7,8 @@
 **Google Drive for Linux.** Two-way sync, a tray icon, a status window and a CLI, with no
 mounts or FUSE. Written in Rust.
 
-A Google Drive for desktop–style client for Linux: it mirrors your whole **My Drive**
-into a local folder (`~/GoogleDrive` by default) and keeps both sides in sync —
+A Google Drive for desktop–style client for Linux: it mirrors the **My Drive** folders
+you choose (or all of it) into a local folder (`~/GoogleDrive` by default) and keeps both sides in sync —
 edits, renames, moves and deletions travel both ways, conflicts never lose data,
 and Google Docs/Sheets/Slides appear as `.gdoc`/`.gsheet`/`.gslides` link files
 that open in the browser.
@@ -16,12 +16,13 @@ that open in the browser.
 ## Why this one?
 
 * **Real two-way sync** into a normal folder: any app can use your files, offline included.
+* **Only what you need:** pick the Drive folders to download (`gdrive folders add Work/Reports`); the rest stays on Drive.
 * **Safe by design:** conflicts keep both versions, deletions go to the trash on both sides, and a missing sync folder never wipes Drive.
 * **Native:** a Rust daemon (systemd user service) and a small Tauri tray app; no Electron, no FUSE.
 * **Easy to install:** single-file AppImage, `.deb`, `.rpm` and a headless CLI bundle for x86_64 and aarch64.
 * **Split across disks:** keep chosen folders on another drive (e.g. games on an SSD, the rest on an HDD); they stay visible in the Drive folder.
 * **File manager menu:** in GNOME Files, right-click to open or copy a file's Drive link, sync now, or move a folder to another drive.
-* **Scriptable:** everything the window does is available from the `gdrive` CLI.
+* **Scriptable:** everything the window does is available from the `gdrive` CLI, so it runs fine on a headless machine.
 
 Compared with the alternatives: `rclone` is an excellent general tool but has no tray, UI
 or live two-way watcher out of the box; Insync and similar clients are paid and closed
@@ -70,6 +71,34 @@ caught by the next scan.
 | Same content already on both sides | Linked without transferring anything |
 | Sync folder missing/unmounted | Sync stops with an error; nothing is deleted remotely |
 | Different account signed in | Previous sync state is discarded first |
+
+### Selected folders
+
+A new setup syncs **nothing** until you pick folders; the whole Drive is still read
+(names only) so you can browse it:
+
+```sh
+gdrive folders browse              # folders at the top of your Drive ([x] synced, [~] partly)
+gdrive folders browse Work         # …and inside Work
+gdrive folders add Work/Reports Photos
+gdrive folders remove Photos       # local copy removed; it stays on Drive
+gdrive folders                     # what is synced
+gdrive folders all                 # sync the whole Drive instead
+gdrive folders only Work --yes     # back from the whole Drive to just some folders
+```
+
+A selected folder comes with everything inside it, and the folders on the way to it
+are created so it sits at its usual path (`Work/Reports` creates an otherwise empty
+`Work`). The choice follows a folder that is renamed or moved, on Drive or locally.
+Outside the selected folders nothing is uploaded: a file you create at the top of the
+Drive folder, or directly in `Work`, stays on this computer only. Moving a synced file
+out of the selected folders moves it on Drive as well, then stops syncing it.
+
+When a folder is unselected, or moved out of the selection on Drive, its local copy is
+deleted (Drive keeps it, so it doesn't go to the desktop trash). Files changed here but
+not uploaded yet are left in place instead, no longer synced. Configs from before this
+feature have no selection and keep syncing the whole Drive. The window has no folder
+picker yet: choose folders from the terminal.
 
 Native Google files (Docs, Sheets, Slides, Forms, Drawings…) become small JSON link
 files; double-clicking opens them in the browser. Deleting or renaming a link file
@@ -156,14 +185,35 @@ secret, then click **Sign in**. Or from a terminal:
 ```sh
 gdrive config client <CLIENT_ID> <CLIENT_SECRET>
 gdrive login          # opens the browser
-gdrive status         # follow the first sync
+gdrive status         # wait until the Drive has been read
+gdrive folders browse # then choose what to download (see "Selected folders")
+gdrive folders add Work
 ```
+
+### Without a desktop (servers, SSH)
+
+Everything works from a terminal: use the `-cli.tar.gz` release bundle (or build with
+`cargo build --release -p gdrived -p gdrive-cli`), then
+
+```sh
+install -m755 gdrived gdrive ~/.local/bin/
+install -Dm644 gdrived.service ~/.config/systemd/user/gdrived.service
+systemctl --user enable --now gdrived
+loginctl enable-linger "$USER"   # keep syncing while you're logged out
+```
+
+`gdrive login` prints the sign-in address. Google sends the browser back to
+`http://127.0.0.1:<port>` on the machine running the daemon, so with the browser on
+another computer, that last page fails to load. Copy its address from the address bar
+and finish on the server with `curl '<address>'`, or forward the port beforehand
+(`ssh -L <port>:127.0.0.1:<port> server`, the port is in the printed address).
 
 ## Everyday use
 
 ```sh
 gdrive status            # state, account, quota, transfers, errors, recent activity
 gdrive pause | resume
+gdrive folders           # which Drive folders are synced (see "Selected folders")
 gdrive sync              # check Drive for changes right now
 gdrive resync            # re-read the whole Drive and rescan the folder
 gdrive config            # show settings
@@ -198,7 +248,8 @@ If the project is useful to you, a star helps others find it.
 
 * Mirrors **My Drive** only. Shared drives and "Shared with me" items that aren't
   in My Drive are not synced; Drive shortcuts are skipped.
-* Mirror mode only: everything is downloaded (no on-demand "streaming" filesystem).
+* Mirror mode only: everything in the selected folders is downloaded (no on-demand
+  "streaming" filesystem). Selection is by folder; single files can't be picked.
 * Remote changes arrive by polling (Drive push notifications need a public HTTPS
   endpoint), so they show up within the poll interval.
 * Files that appear in several folders on Drive (legacy multi-parent) are placed under their first parent.
