@@ -19,7 +19,7 @@ that open in the browser.
 * **Only what you need:** pick the Drive folders to download, in the Folders tab or with `gdrive folders add Work/Reports`; the rest stays on Drive.
 * **Safe by design:** conflicts keep both versions, deletions go to the trash on both sides, and a missing sync folder never wipes Drive.
 * **Native:** a Rust daemon (systemd user service) and a small Tauri tray app; no Electron, no FUSE.
-* **Easy to install:** single-file AppImage, `.deb`, `.rpm` and a headless CLI bundle for x86_64 and aarch64.
+* **Easy to install:** single-file AppImage, `.deb` and `.rpm`, plus lighter terminal-only `.deb`/`.rpm` packages, for x86_64 and aarch64.
 * **Split across disks:** keep chosen folders on another drive (e.g. games on an SSD, the rest on an HDD); they stay visible in the Drive folder.
 * **File manager menu:** in GNOME Files, right-click to open or copy a file's Drive link, sync now, or move a folder to another drive.
 * **Scriptable:** everything the window does is available from the `gdrive` CLI, so it runs fine on a headless machine.
@@ -124,12 +124,22 @@ folder. Add your own glob patterns in Settings.
 Prebuilt packages for **x86_64** and **aarch64** are attached to every
 [GitHub release](https://github.com/psyycker/google-drive-desktop-linux/releases):
 
-| File | For |
-|---|---|
-| `gdrive-linux-<version>-<arch>.AppImage` | Any distro: `chmod +x` and run. One file holding the app, the daemon (`--daemon`) and the CLI (`--cli …`). |
-| `.deb` | Debian, Ubuntu, Mint, Pop!_OS |
-| `.rpm` | Fedora, openSUSE, RHEL |
-| `gdrive-linux-<version>-<arch>-cli.tar.gz` | Headless/servers: `gdrived` + `gdrive` + the systemd user unit |
+Two editions: **desktop** (tray icon, status window, CLI) and **terminal-only** (the
+daemon and the `gdrive` CLI, about half the size, with no WebKitGTK/GTK dependency).
+They contain the same daemon and CLI, so their packages replace each other.
+
+| File | Edition | For |
+|---|---|---|
+| `gdrive-linux-<version>-<arch>.AppImage` | desktop | Any distro: `chmod +x` and run. One file holding the app, the daemon (`--daemon`) and the CLI (`--cli …`). |
+| `gdrive-linux_<version>_<arch>.deb` | desktop | Debian, Ubuntu, Mint, Pop!_OS |
+| `gdrive-linux-<version>-1.<arch>.rpm` | desktop | Fedora, openSUSE, RHEL |
+| `gdrive-linux-cli_<version>-1_<arch>.deb` | terminal | Debian, Ubuntu, … (servers included) |
+| `gdrive-linux-cli-<version>-1.<arch>.rpm` | terminal | Fedora, openSUSE, RHEL |
+| `gdrive-linux-<version>-<arch>-cli.tar.gz` | terminal | Any distro, no package manager: `gdrived` + `gdrive` + the systemd user unit |
+
+Switching editions: `sudo apt install ./gdrive-linux-cli_….deb` replaces the desktop
+package by itself; on Fedora use `sudo dnf swap gdrive-linux ./gdrive-linux-cli-….rpm`
+(or the other way round). Settings and sync state are kept.
 
 Releases are built by `.github/workflows/release.yml` whenever a `v*` tag is pushed:
 
@@ -192,15 +202,27 @@ gdrive folders add Work
 
 ### Without a desktop (servers, SSH)
 
-Everything works from a terminal: use the `-cli.tar.gz` release bundle (or build with
-`cargo build --release -p gdrived -p gdrive-cli`), then
+Everything works from a terminal. Install the terminal-only package, then start the
+service as the user who syncs:
+
+```sh
+sudo apt install ./gdrive-linux-cli_<version>-1_amd64.deb      # Debian, Ubuntu
+sudo dnf install ./gdrive-linux-cli-<version>-1.x86_64.rpm     # Fedora, RHEL
+
+systemctl --user enable --now gdrived
+sudo loginctl enable-linger "$USER"   # keep syncing while you're logged out
+```
+
+Without a package manager, use the `-cli.tar.gz` bundle instead:
 
 ```sh
 install -m755 gdrived gdrive ~/.local/bin/
 install -Dm644 gdrived.service ~/.config/systemd/user/gdrived.service
 systemctl --user enable --now gdrived
-loginctl enable-linger "$USER"   # keep syncing while you're logged out
 ```
+
+To build the packages yourself: `cargo build --release -p gdrived -p gdrive-cli`, then
+`scripts/cli-packages.sh` (needs [nfpm](https://nfpm.goreleaser.com)).
 
 `gdrive login` prints the sign-in address. Google sends the browser back to
 `http://127.0.0.1:<port>` on the machine running the daemon, so with the browser on

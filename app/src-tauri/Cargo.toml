@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Desktop UI and tray icon for gdrive-linux"
+# The packages' maintainer.
+authors = ["psyycker"]
 
 [[bin]]
 name = "gdrive-app"

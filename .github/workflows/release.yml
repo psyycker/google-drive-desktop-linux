@@ -77,6 +77,21 @@ jobs:
       - name: Build daemon and CLI
         run: cargo build --release -p gdrived -p gdrive-cli
 
+      # Packages the headless gdrive-linux-cli .deb and .rpm (packaging/nfpm-cli.yaml).
+      - name: Install nfpm
+        env:
+          NFPM_VERSION: 2.47.0
+        run: |
+          case "$(uname -m)" in x86_64) a=x86_64 ;; aarch64) a=arm64 ;; esac
+          tarball="nfpm_${NFPM_VERSION}_Linux_$a.tar.gz"
+          base="https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "$base/$tarball"
+          curl -sSfLO "$base/checksums.txt"
+          sha256sum --ignore-missing -c checksums.txt
+          sudo tar -xzf "$tarball" -C /usr/local/bin nfpm
+          nfpm --version
+
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version '^2' --locked
 
@@ -104,7 +119,9 @@ jobs:
           cp $bundle/deb/*.deb out/
           cp $bundle/rpm/*.rpm out/
 
-          # Headless option: just the daemon and CLI, plus the systemd user unit.
+          # Headless options: just the daemon and CLI, plus the systemd user unit, as
+          # packages and as a tarball.
+          scripts/cli-packages.sh out
           stage="gdrive-linux-$VERSION-$ARCH-cli"
           mkdir -p "$stage"
           cp target/release/gdrived target/release/gdrive "$stage/"
@@ -151,6 +168,10 @@ jobs:
             | `gdrive-linux-*-x86_64.AppImage` / `-aarch64.AppImage` | Any distro: `chmod +x` and run. Includes the app, daemon (`--daemon`) and CLI (`--cli`). |
             | `gdrive-linux_*_amd64.deb` / `_arm64.deb` | Debian, Ubuntu, Mint, Pop!_OS |
             | `gdrive-linux-*.x86_64.rpm` / `.aarch64.rpm` | Fedora, openSUSE, RHEL |
-            | `gdrive-linux-*-cli.tar.gz` | Headless/servers: `gdrived` + `gdrive` + systemd user unit |
+            | `gdrive-linux-cli_*_amd64.deb` / `_arm64.deb` | Terminal only (no window or tray, no WebKitGTK), for Debian/Ubuntu servers and desktops |
+            | `gdrive-linux-cli-*.x86_64.rpm` / `.aarch64.rpm` | Terminal only, for Fedora, openSUSE, RHEL |
+            | `gdrive-linux-*-cli.tar.gz` | Terminal only, any distro: `gdrived` + `gdrive` + systemd user unit |
 
-            First run: create a Google OAuth "Desktop app" client, then paste its ID and secret into the app. See the [README](https://github.com/${{ github.repository }}#1-create-a-google-oauth-client-one-time-5-minutes).
+            The desktop and terminal-only packages replace each other: install one or the other.
+
+            First run: create a Google OAuth "Desktop app" client, then paste its ID and secret into the app (or run `gdrive config client <id> <secret>`). See the [README](https://github.com/${{ github.repository }}#1-create-a-google-oauth-client-one-time-5-minutes).

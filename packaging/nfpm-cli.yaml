@@ -1,0 +1,45 @@
+# The headless packages: daemon, CLI and systemd user unit, without the window and
+# tray (and their WebKitGTK dependency). Built by scripts/cli-packages.sh, which sets
+# VERSION and ARCH (amd64/arm64), from the binaries in target/release.
+name: gdrive-linux-cli
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: 1
+section: net
+priority: optional
+maintainer: psyycker
+homepage: https://github.com/psyycker/google-drive-desktop-linux
+license: MIT
+description: |-
+  Google Drive sync for Linux, for terminals and servers.
+  Two-way sync of chosen My Drive folders (or all of it) into a local folder,
+  run by the gdrived systemd user service and controlled with the gdrive command.
+
+# Same files as the desktop package (gdrive-linux), which includes all of this.
+conflicts:
+  - gdrive-linux
+overrides:
+  deb:
+    replaces:
+      - gdrive-linux
+
+contents:
+  - src: target/release/gdrived
+    dst: /usr/bin/gdrived
+    file_info: { mode: 0755 }
+  - src: target/release/gdrive
+    dst: /usr/bin/gdrive
+    file_info: { mode: 0755 }
+  - src: packaging/gdrived-system.service
+    dst: /usr/lib/systemd/user/gdrived.service
+    file_info: { mode: 0644 }
+  - src: README.md
+    dst: /usr/share/doc/gdrive-linux-cli/README.md
+    file_info: { mode: 0644 }
+  - src: LICENSE
+    dst: /usr/share/licenses/gdrive-linux-cli/LICENSE
+    file_info: { mode: 0644 }
+
+scripts:
+  postinstall: packaging/cli-postinstall.sh

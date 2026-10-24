@@ -5,7 +5,7 @@
     "targets": ["appimage", "deb", "rpm"],
     "category": "Utility",
     "shortDescription": "Google Drive sync for Linux",
-    "longDescription": "Mirrors your whole Google Drive into a local folder and keeps both sides in sync, with a tray icon and status window.",
+    "longDescription": "Mirrors the Google Drive folders you choose (or all of it) into a local folder and keeps both sides in sync, with a tray icon and status window.",
     "externalBin": ["binaries/gdrived", "binaries/gdrive"],
     "linux": {
       "appimage": {
@@ -13,6 +13,8 @@
       },
       "deb": {
         "section": "net",
+        "conflicts": ["gdrive-linux-cli"],
+        "replaces": ["gdrive-linux-cli"],
         "files": {
           "/usr/share/mime/packages/gdrive-linux.xml": "../../packaging/gdrive-linux-mime.xml",
           "/usr/share/applications/gdrive-open.desktop": "../../packaging/gdrive-open.desktop",
@@ -21,6 +23,7 @@
       },
       "rpm": {
         "release": "1",
+        "conflicts": ["gdrive-linux-cli"],
         "files": {
           "/usr/share/mime/packages/gdrive-linux.xml": "../../packaging/gdrive-linux-mime.xml",
           "/usr/share/applications/gdrive-open.desktop": "../../packaging/gdrive-open.desktop",
