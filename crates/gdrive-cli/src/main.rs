@@ -162,13 +162,10 @@ async fn status(recent: usize) -> Result<()> {
         }
     }
     println!("Folder:   {}", st.sync_root);
-    // An older daemon doesn't know about folder selection; just leave the line out.
-    if let Ok(Response::Folders { folders }) = ipc::call(&Request::GetFolders).await {
-        match folders.as_deref() {
-            None => println!("Syncing:  the whole Drive"),
-            Some([]) => println!("Syncing:  no folders yet (pick some: `gdrive folders browse`, `gdrive folders add <folder>`)"),
-            Some(sel) => println!("Syncing:  {} selected folder(s) (`gdrive folders` lists them)", sel.len()),
-        }
+    match st.selected_folders {
+        None => println!("Syncing:  the whole Drive"),
+        Some(0) => println!("Syncing:  no folders yet (pick some: `gdrive folders browse`, `gdrive folders add <folder>`)"),
+        Some(n) => println!("Syncing:  {n} selected folder(s) (`gdrive folders` lists them)"),
     }
     if !st.version.is_empty() {
         println!("Version:  {}", st.version);

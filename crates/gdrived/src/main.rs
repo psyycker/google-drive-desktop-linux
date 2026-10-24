@@ -51,8 +51,13 @@ impl Daemon {
         st.message = message;
     }
 
+    fn publish_selection(&self) {
+        self.status.write().unwrap().selected_folders = self.config.selected_folders.as_ref().map(Vec::len);
+    }
+
     /// Starts the engine if configured and signed in; otherwise reflects why not.
     fn start_engine(&mut self) -> Result<()> {
+        self.publish_selection();
         if !self.config.is_complete() {
             self.set_state(SyncState::SetupRequired, None);
             return Ok(());
@@ -151,6 +156,7 @@ async fn handle(daemon: &Shared, req: Request) -> Result<Response> {
             let mut fresh = Status::new(SyncState::SignedOut, root);
             fresh.update = update;
             *d.status.write().unwrap() = fresh;
+            d.publish_selection();
             tracing::info!("signed out");
             Response::Ok
         }

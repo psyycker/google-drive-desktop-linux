@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use gdrive_core::config::Config;
-use gdrive_core::ipc::{self, Request, Response};
+use gdrive_core::config::{Config, SelectedFolder};
+use gdrive_core::ipc::{self, FolderEntry, Request, Response};
 use gdrive_core::status::Status;
 use tauri::State;
 
@@ -59,6 +59,30 @@ pub async fn redownload(state: State<'_, AppState>) -> CmdResult<()> {
 #[tauri::command]
 pub async fn relocate_folder(state: State<'_, AppState>, folder: PathBuf, location: Option<String>) -> CmdResult<()> {
     simple(&state, Request::Relocate { folder, location }).await
+}
+
+/// The Drive folders chosen for syncing; `None` when the whole Drive syncs.
+#[tauri::command]
+pub async fn get_folders() -> CmdResult<Option<Vec<SelectedFolder>>> {
+    match daemon::call(Request::GetFolders).await.map_err(err)? {
+        Response::Folders { folders } => Ok(folders),
+        other => Err(format!("unexpected reply from gdrived: {other:?}")),
+    }
+}
+
+/// The folders directly inside a Drive folder (`""` for the Drive root).
+#[tauri::command]
+pub async fn browse_folders(path: PathBuf) -> CmdResult<Vec<FolderEntry>> {
+    match daemon::call(Request::Browse { path }).await.map_err(err)? {
+        Response::Listing { folders } => Ok(folders),
+        other => Err(format!("unexpected reply from gdrived: {other:?}")),
+    }
+}
+
+/// Syncs only these Drive folders, or the whole Drive with `None`.
+#[tauri::command]
+pub async fn set_folders(state: State<'_, AppState>, folders: Option<Vec<PathBuf>>) -> CmdResult<()> {
+    simple(&state, Request::SetFolders { folders }).await
 }
 
 #[tauri::command]

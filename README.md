@@ -16,7 +16,7 @@ that open in the browser.
 ## Why this one?
 
 * **Real two-way sync** into a normal folder: any app can use your files, offline included.
-* **Only what you need:** pick the Drive folders to download (`gdrive folders add Work/Reports`); the rest stays on Drive.
+* **Only what you need:** pick the Drive folders to download, in the Folders tab or with `gdrive folders add Work/Reports`; the rest stays on Drive.
 * **Safe by design:** conflicts keep both versions, deletions go to the trash on both sides, and a missing sync folder never wipes Drive.
 * **Native:** a Rust daemon (systemd user service) and a small Tauri tray app; no Electron, no FUSE.
 * **Easy to install:** single-file AppImage, `.deb`, `.rpm` and a headless CLI bundle for x86_64 and aarch64.
@@ -97,8 +97,8 @@ out of the selected folders moves it on Drive as well, then stops syncing it.
 When a folder is unselected, or moved out of the selection on Drive, its local copy is
 deleted (Drive keeps it, so it doesn't go to the desktop trash). Files changed here but
 not uploaded yet are left in place instead, no longer synced. Configs from before this
-feature have no selection and keep syncing the whole Drive. The window has no folder
-picker yet: choose folders from the terminal.
+feature have no selection and keep syncing the whole Drive. In the window, the
+**Folders** tab does the same with a tree of your Drive's folders.
 
 Native Google files (Docs, Sheets, Slides, Forms, Drawings…) become small JSON link
 files; double-clicking opens them in the browser. Deleting or renaming a link file

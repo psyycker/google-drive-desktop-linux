@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 
-import type { Config, Status } from './types';
+import type { Config, FolderEntry, SelectedFolder, Status } from './types';
 
 export const getStatus = () => invoke<Status>('get_status');
 
@@ -17,6 +17,13 @@ export const redownload = () => invoke<void>('redownload');
 /** Moves a Drive folder to a storage location, or back to the main drive with `null`. */
 export const relocateFolder = (folder: string, location: string | null) =>
   invoke<void>('relocate_folder', { folder, location });
+
+/** The Drive folders chosen for syncing; `null` when the whole Drive syncs. */
+export const getFolders = () => invoke<SelectedFolder[] | null>('get_folders');
+/** The folders directly inside a Drive folder (`''` for the Drive root). */
+export const browseFolders = (path: string) => invoke<FolderEntry[]>('browse_folders', { path });
+/** Syncs only these Drive folders, or the whole Drive with `null`. */
+export const setFolders = (folders: string[] | null) => invoke<void>('set_folders', { folders });
 
 /** Starts the OAuth flow; resolves to the URL in case the browser did not open. */
 export const startLogin = () => invoke<string>('start_login');

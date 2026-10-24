@@ -141,6 +141,10 @@ pub struct Status {
     /// Set while a folder is being moved to or from another drive.
     #[serde(default)]
     pub relocation: Option<Relocation>,
+    /// How many Drive folders are selected for syncing; `None` when the whole Drive
+    /// syncs (also what a daemon from before folder selection means).
+    #[serde(default)]
+    pub selected_folders: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -203,6 +207,7 @@ impl Status {
             version: crate::update::CURRENT_VERSION.to_owned(),
             update: None,
             relocation: None,
+            selected_folders: None,
         }
     }
 

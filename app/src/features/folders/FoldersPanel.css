@@ -1,0 +1,70 @@
+/* Adds to the panel's own padding; the bottom leaves room for the apply bar. */
+.folders { padding: 4px 12px 64px; }
+.folders-intro { margin-bottom: 12px; }
+.folders-foot { margin-top: 10px; }
+
+.modes { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.mode {
+  display: flex; align-items: flex-start; gap: 10px; cursor: pointer;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+  transition: border-color .12s, background .12s;
+}
+.mode:hover { background: var(--surface-2); }
+.mode.active { border-color: var(--accent); background: var(--accent-soft); }
+.mode input { margin: 2px 0 0; width: 16px; height: 16px; accent-color: var(--accent); flex: none; }
+.mode > span { display: grid; gap: 2px; }
+.mode-title { font-weight: 500; }
+
+.chosen { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.chosen-empty { margin-bottom: 10px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 2px; max-width: 100%;
+  padding: 2px 2px 2px 10px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent); font-size: 12.5px; font-weight: 500;
+}
+.chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-remove {
+  flex: none; width: 20px; height: 20px; border: 0; border-radius: 50%;
+  background: transparent; color: inherit; cursor: pointer; display: grid; place-items: center;
+}
+.chip-remove:hover { background: var(--accent-soft); filter: brightness(.9); }
+.chip-remove:focus-visible { outline: none; box-shadow: var(--focus); }
+.chip-remove svg { width: 12px; height: 12px; }
+
+.tree-box {
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+  max-height: 340px; overflow-y: auto; padding: 4px 0;
+}
+.tree { list-style: none; margin: 0; padding: 0; }
+.tree-row { display: flex; align-items: center; gap: 2px; padding: 2px 8px; }
+.tree-row:hover { background: var(--surface-2); }
+.tree-toggle {
+  flex: none; width: 24px; height: 24px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--text-3); cursor: pointer; display: grid; place-items: center;
+}
+.tree-toggle:hover { color: var(--text); }
+.tree-toggle:focus-visible { outline: none; box-shadow: var(--focus); }
+.tree-toggle svg { width: 16px; height: 16px; transition: transform .12s; }
+.tree-toggle.open svg { transform: rotate(90deg); }
+.tree-label { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer; }
+.tree-label input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); flex: none; }
+.tree-label input:disabled + .tree-folder + .tree-name { color: var(--text-2); }
+.tree-folder { width: 16px; height: 16px; flex: none; color: var(--text-3); }
+.tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-note { padding: 4px 8px; font-size: 12px; color: var(--text-3); }
+.tree-note.error-text { color: var(--danger); }
+
+.tree-wait {
+  display: flex; align-items: center; gap: 10px; padding: 14px 12px;
+  border: 1px dashed var(--border); border-radius: 8px; color: var(--text-2);
+}
+.tree-wait svg { width: 18px; height: 18px; flex: none; color: var(--accent); animation: spin 1.4s linear infinite; }
+
+.savebar.confirming { align-items: flex-end; border-color: var(--danger); }
+.apply-confirm { display: grid; gap: 4px; min-width: 0; font-weight: 400; }
+.apply-confirm b { word-break: break-word; }
+
+@media (max-width: 480px) {
+  .modes { grid-template-columns: 1fr; }
+}
+.savebar.confirming .btn-row { flex-wrap: nowrap; flex: none; }

@@ -7,8 +7,11 @@ import { useDaemon } from '../../state/DaemonContext';
 import { bannerContent } from './bannerContent';
 import './StatusBanner.css';
 
-/** The sync state, with Pause/Resume and Sync now. */
-export function StatusBanner() {
+/**
+ * The sync state, with Pause/Resume and Sync now. `onChooseFolders` adds a button for
+ * when no folders are chosen yet.
+ */
+export function StatusBanner({ onChooseFolders }: { onChooseFolders?: () => void }) {
   const { status, loaded } = useDaemon();
   const command = useDaemonCommand();
   const b = bannerContent(status, loaded);
@@ -16,6 +19,7 @@ export function StatusBanner() {
   // Syncing is stopped while a folder moves between drives; it resumes by itself.
   const active = !!status && isActiveState(status.state) && !status.relocation;
   const paused = status?.state === 'paused';
+  const nothingChosen = status?.selected_folders === 0;
 
   return (
     <section className="banner" data-tone={b.tone}>
@@ -30,10 +34,17 @@ export function StatusBanner() {
       </div>
       {active && (
         <div className="banner-actions">
-          <Button variant="ghost" size="sm" onClick={() => command(paused ? api.resume() : api.pause())}>
-            {paused ? 'Resume' : 'Pause'}
-          </Button>
-          {!paused && (
+          {nothingChosen && onChooseFolders && (
+            <Button variant="primary" size="sm" onClick={onChooseFolders}>
+              Choose folders
+            </Button>
+          )}
+          {(paused || !nothingChosen) && (
+            <Button variant="ghost" size="sm" onClick={() => command(paused ? api.resume() : api.pause())}>
+              {paused ? 'Resume' : 'Pause'}
+            </Button>
+          )}
+          {!paused && !nothingChosen && (
             <Button variant="ghost" size="sm" onClick={() => command(api.syncNow(), 'Checking for changes…')}>
               Sync now
             </Button>

@@ -94,6 +94,8 @@ export interface Status {
   update: UpdateInfo | null;
   /** Set while a folder is being moved to or from another drive. */
   relocation: Relocation | null;
+  /** How many Drive folders are selected for syncing; `null` when the whole Drive syncs. */
+  selected_folders: number | null;
 }
 
 export interface Relocation {
@@ -125,6 +127,18 @@ export interface SelectedFolder {
   id: string;
   /** Relative to the Drive root when last looked up, e.g. `Work/Reports`. */
   path: string;
+}
+
+/** How much of a Drive folder is synced. */
+export type Coverage = 'whole' | 'partly' | 'unsynced';
+
+/** A folder on Drive, as listed for choosing what to sync. */
+export interface FolderEntry {
+  /** Its name on Drive. */
+  name: string;
+  /** Relative to the Drive root, spelled as on disk. */
+  path: string;
+  coverage: Coverage;
 }
 
 /** User configuration (`~/.config/gdrive-linux/config.toml`). */

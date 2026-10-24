@@ -45,6 +45,14 @@ export function bannerContent(status: Status | null, loaded: boolean): BannerCon
     case 'starting':
       return { tone: 'busy', icon: 'loader', spin: true, title: 'Starting…', sub: 'Connecting to Google Drive' };
     case 'idle': {
+      if (s.selected_folders === 0) {
+        return {
+          tone: 'neutral',
+          icon: 'folderPlus',
+          title: 'No folders chosen yet',
+          sub: 'Choose the Drive folders to keep on this computer',
+        };
+      }
       const failed = s.errors.length;
       return {
         tone: failed ? 'warn' : 'ok',
